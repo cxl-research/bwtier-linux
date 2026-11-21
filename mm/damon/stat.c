@@ -57,7 +57,7 @@ static void damon_stat_set_estimated_memory_bandwidth(struct damon_ctx *c)
 	damon_for_each_target(t, c) {
 		damon_for_each_region(r, t)
 			access_bytes += (r->ar.end - r->ar.start) *
-				r->nr_accesses;
+				damon_region_nr_accesses(r, &c->attrs);
 	}
 	estimated_memory_bandwidth = access_bytes * USEC_PER_MSEC *
 		MSEC_PER_SEC / c->attrs.aggr_interval;

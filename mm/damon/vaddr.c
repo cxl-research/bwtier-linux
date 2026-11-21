@@ -24,27 +24,31 @@
 #endif
 
 /*
- * Page-table level to sample.  0 is the leaf PTE, 1 is PMD, 2 is PUD.
- * A level is usable only when Telescope is on, the CPU maintains accessed
- * bits on non-leaf entries, and the sampling address's entry at that level
- * lies entirely inside the region.  Smaller regions therefore fall through
- * to lower levels.
+ * Page table level of the entries to sample is that of the region, 0 for the
+ * leaf PTE, 1 for PMD, and 2 for PUD.  See damon_region_level().
  */
-static int damon_va_profile_level(struct damon_ctx *ctx, unsigned long start,
-		unsigned long end, unsigned long addr)
+static const unsigned int damon_va_level_shift[] = {
+	PAGE_SHIFT, PMD_SHIFT, PUD_SHIFT,
+};
+
+/*
+ * Address range [@start, @end) to check in one sampling interval.  It is the
+ * intersection of the region and the block of max_ptes_per_sampling entries
+ * (aligned to the block size) that contains the sampling address.  The
+ * boundaries of a region are aligned to its level, so the range has whole
+ * entries.  With one entry per sampling, the range is the entry of the
+ * sampling address.
+ */
+static void damon_va_scan_range(struct damon_ctx *ctx, struct damon_region *r,
+		int level, unsigned long *start, unsigned long *end)
 {
-	if (!ctx->telescope || !arch_has_hw_nonleaf_pmd_young())
-		return 0;
+	unsigned long unit = 1UL << damon_va_level_shift[level];
+	unsigned long span = unit *
+		damon_sanitize_max_ptes(ctx->max_ptes_per_sampling);
+	unsigned long base = ALIGN_DOWN(r->sampling_addr, span);
 
-	if (pmd_addr_start(addr, start - 1) < start ||
-			pmd_addr_end(addr, end + 1) > end)
-		return 0;
-
-	if (pud_addr_start(addr, start - 1) < start ||
-			pud_addr_end(addr, end + 1) > end)
-		return 1;
-
-	return 2;
+	*start = max(base, ALIGN(r->ar.start, unit));
+	*end = min(base + span, ALIGN_DOWN(r->ar.end, unit));
 }
 
 /*
@@ -330,7 +334,7 @@ static void damon_va_update(struct damon_ctx *ctx)
 static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 		unsigned long next, struct mm_walk *walk)
 {
-	pte_t *pte;
+	pte_t *pte, *start_pte;
 	pmd_t pmde;
 	spinlock_t *ptl;
 
@@ -351,14 +355,15 @@ static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 		spin_unlock(ptl);
 	}
 
-	pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+	start_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
 	if (!pte)
 		return 0;
-	if (!pte_present(ptep_get(pte)))
-		goto out;
-	damon_ptep_mkold(pte, walk->vma, addr);
-out:
-	pte_unmap_unlock(pte, ptl);
+	for (; addr < next; pte++, addr += PAGE_SIZE) {
+		if (!pte_present(ptep_get(pte)))
+			continue;
+		damon_ptep_mkold(pte, walk->vma, addr);
+	}
+	pte_unmap_unlock(start_pte, ptl);
 	return 0;
 }
 
@@ -511,10 +516,26 @@ static void damon_va_mkold(struct damon_ctx *ctx, struct mm_struct *mm,
 		struct damon_region *r)
 {
 	unsigned long addr = r->sampling_addr;
-	int level = damon_va_profile_level(ctx, r->ar.start, r->ar.end, addr);
+	int level = damon_region_level(ctx, r);
+	unsigned long start, end;
+
+	damon_va_scan_range(ctx, r, level, &start, &end);
 
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops[level], NULL);
+	if (level == 2) {
+		/*
+		 * Visit the PUD entries one by one, at the sampling address's
+		 * offset in the PUD.  walk_page_range() reaches a hugetlb VMA's
+		 * pages one by one, which would make the walk of a range of
+		 * PUDs visit every hugetlb page of it.
+		 */
+		for (addr = start + (addr & (PUD_SIZE - 1)); addr < end;
+				addr += PUD_SIZE)
+			walk_page_range(mm, addr, addr + 1,
+					&damon_mkold_ops[level], NULL);
+	} else {
+		walk_page_range(mm, start, end, &damon_mkold_ops[level], NULL);
+	}
 	mmap_read_unlock(mm);
 }
 
@@ -549,13 +570,23 @@ static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
 struct damon_young_walk_private {
 	/* size of the folio for the access checked virtual memory address */
 	unsigned long *folio_sz;
-	bool young;
+	/* log2 of the size of the entries sampled */
+	unsigned int shift;
+	/* number of the sampled entries found accessed */
+	unsigned int nr_young;
 };
+
+/* Count the entries in [@addr, @end) as accessed.  An entry is one at least. */
+static void damon_young_count(struct damon_young_walk_private *priv,
+		unsigned long addr, unsigned long end)
+{
+	priv->nr_young += max(1UL, (end - addr) >> priv->shift);
+}
 
 static int damon_young_pmd_entry(pmd_t *pmd, unsigned long addr,
 		unsigned long next, struct mm_walk *walk)
 {
-	pte_t *pte;
+	pte_t *pte, *start_pte;
 	pte_t ptent;
 	spinlock_t *ptl;
 	struct folio *folio;
@@ -583,7 +614,7 @@ static int damon_young_pmd_entry(pmd_t *pmd, unsigned long addr,
 		if (pmd_young(pmde) || !folio_test_idle(folio) ||
 					mmu_notifier_test_young(walk->mm,
 						addr))
-			priv->young = true;
+			damon_young_count(priv, addr, next);
 		*priv->folio_sz = HPAGE_PMD_SIZE;
 		folio_put(folio);
 huge_out:
@@ -594,22 +625,23 @@ huge_out:
 regular_page:
 #endif	/* CONFIG_TRANSPARENT_HUGEPAGE */
 
-	pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+	start_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
 	if (!pte)
 		return 0;
-	ptent = ptep_get(pte);
-	if (!pte_present(ptent))
-		goto out;
-	folio = damon_get_folio(pte_pfn(ptent));
-	if (!folio)
-		goto out;
-	if (pte_young(ptent) || !folio_test_idle(folio) ||
-			mmu_notifier_test_young(walk->mm, addr))
-		priv->young = true;
-	*priv->folio_sz = folio_size(folio);
-	folio_put(folio);
-out:
-	pte_unmap_unlock(pte, ptl);
+	for (; addr < next; pte++, addr += PAGE_SIZE) {
+		ptent = ptep_get(pte);
+		if (!pte_present(ptent))
+			continue;
+		folio = damon_get_folio(pte_pfn(ptent));
+		if (!folio)
+			continue;
+		if (pte_young(ptent) || !folio_test_idle(folio) ||
+				mmu_notifier_test_young(walk->mm, addr))
+			priv->nr_young++;
+		*priv->folio_sz = folio_size(folio);
+		folio_put(folio);
+	}
+	pte_unmap_unlock(start_pte, ptl);
 	return 0;
 }
 
@@ -634,7 +666,7 @@ static int damon_young_hugetlb_entry(pte_t *pte, unsigned long hmask,
 
 	if (pte_young(entry) || !folio_test_idle(folio) ||
 	    mmu_notifier_test_young(walk->mm, addr))
-		priv->young = true;
+		damon_young_count(priv, addr, end);
 	*priv->folio_sz = huge_page_size(h);
 
 	folio_put(folio);
@@ -665,7 +697,7 @@ static int damon_young_hugetlb_pud(pte_t *pte, unsigned long hmask,
 	pude = pudp_get(pud);
 	if (pud_present(pude) && !pud_leaf(pude)) {
 		if (pud_young(pude) || mmu_notifier_test_young(walk->mm, addr))
-			priv->young = true;
+			damon_young_count(priv, addr, end);
 		*priv->folio_sz = PUD_SIZE;
 	}
 	spin_unlock(ptl);
@@ -690,7 +722,7 @@ static int damon_young_pmd(pmd_t *pmd, unsigned long addr,
 		return 0;
 	}
 	if (pmd_young(pmde) || mmu_notifier_test_young(walk->mm, addr))
-		priv->young = true;
+		damon_young_count(priv, addr, next);
 	*priv->folio_sz = PMD_SIZE;
 	spin_unlock(ptl);
 	return 0;
@@ -710,7 +742,7 @@ static int damon_young_pud(pud_t *pud, unsigned long addr,
 		return 0;
 	}
 	if (pud_young(pude) || mmu_notifier_test_young(walk->mm, addr))
-		priv->young = true;
+		damon_young_count(priv, addr, next);
 	*priv->folio_sz = PUD_SIZE;
 	spin_unlock(ptl);
 	return 0;
@@ -734,20 +766,38 @@ static const struct mm_walk_ops damon_young_ops[] = {
 	},
 };
 
-static bool damon_va_young(struct damon_ctx *ctx, struct mm_struct *mm,
-		struct damon_region *r, unsigned long *folio_sz)
+/*
+ * Check the entries of the scan range of the region, and return how many were
+ * accessed.  @nr_samples is set to the number of the entries checked.
+ */
+static unsigned int damon_va_young(struct damon_ctx *ctx, struct mm_struct *mm,
+		struct damon_region *r, unsigned long *folio_sz,
+		unsigned int *nr_samples)
 {
 	unsigned long addr = r->sampling_addr;
-	int level = damon_va_profile_level(ctx, r->ar.start, r->ar.end, addr);
+	int level = damon_region_level(ctx, r);
 	struct damon_young_walk_private arg = {
 		.folio_sz = folio_sz,
-		.young = false,
+		.shift = damon_va_level_shift[level],
+		.nr_young = 0,
 	};
+	unsigned long start, end;
+
+	damon_va_scan_range(ctx, r, level, &start, &end);
+	*nr_samples = (end - start) >> arg.shift;
 
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_young_ops[level], &arg);
+	if (level == 2) {
+		/* Same as damon_va_mkold() */
+		for (addr = start + (addr & (PUD_SIZE - 1)); addr < end;
+				addr += PUD_SIZE)
+			walk_page_range(mm, addr, addr + 1,
+					&damon_young_ops[level], &arg);
+	} else {
+		walk_page_range(mm, start, end, &damon_young_ops[level], &arg);
+	}
 	mmap_read_unlock(mm);
-	return arg.young;
+	return arg.nr_young;
 }
 
 /*
@@ -763,21 +813,30 @@ static void __damon_va_check_access(struct damon_ctx *ctx,
 	static unsigned long last_addr;
 	static unsigned long last_folio_sz = PAGE_SIZE;
 	static bool last_accessed;
+	unsigned int nr_accessed, nr_samples;
 
 	if (!mm) {
 		damon_update_region_access_rate(r, false, attrs);
 		return;
 	}
 
-	/* If the region is in the last checked page, reuse the result */
-	if (same_target && (ALIGN_DOWN(last_addr, last_folio_sz) ==
-				ALIGN_DOWN(r->sampling_addr, last_folio_sz))) {
+	/*
+	 * If the region is in the last checked page, reuse the result.  Only
+	 * one entry is checked per sampling in the case.
+	 */
+	if (same_target && damon_sanitize_max_ptes(
+				ctx->max_ptes_per_sampling) == 1 &&
+			(ALIGN_DOWN(last_addr, last_folio_sz) ==
+			 ALIGN_DOWN(r->sampling_addr, last_folio_sz))) {
 		damon_update_region_access_rate(r, last_accessed, attrs);
 		return;
 	}
 
-	last_accessed = damon_va_young(ctx, mm, r, &last_folio_sz);
-	damon_update_region_access_rate(r, last_accessed, attrs);
+	nr_accessed = damon_va_young(ctx, mm, r, &last_folio_sz, &nr_samples);
+	nr_accessed = min(nr_accessed, nr_samples);
+	last_accessed = nr_accessed;
+	damon_update_region_access_rate_samples(r, nr_accessed, nr_samples,
+			attrs);
 
 	last_addr = r->sampling_addr;
 }
@@ -796,7 +855,9 @@ static unsigned int damon_va_check_accesses(struct damon_ctx *ctx)
 		damon_for_each_region(r, t) {
 			__damon_va_check_access(ctx, mm, r, same_target,
 					&ctx->attrs);
-			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
+			max_nr_accesses = max(
+					damon_region_nr_accesses(r, &ctx->attrs),
+					max_nr_accesses);
 			same_target = true;
 		}
 		if (mm)

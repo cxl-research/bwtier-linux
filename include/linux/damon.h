@@ -8,6 +8,8 @@
 #ifndef _DAMON_H_
 #define _DAMON_H_
 
+#include <linux/log2.h>
+#include <linux/math64.h>
 #include <linux/memcontrol.h>
 #include <linux/mutex.h>
 #include <linux/time64.h>
@@ -50,6 +52,7 @@ struct damon_size_range {
  * @ar:			The address range of the region.
  * @sampling_addr:	Address of the sample for the next access check.
  * @nr_accesses:	Access frequency of this region.
+ * @nr_samples:		Number of PTEs sampled in this aggregation interval.
  * @nr_accesses_bp:	@nr_accesses in basis point (0.01%) that updated for
  *			each sampling interval.
  * @list:		List head for siblings.
@@ -60,6 +63,14 @@ struct damon_size_range {
  * during the last sampling interval is found.  The update of this field should
  * not be done with direct access but with the helper function,
  * damon_update_region_access_rate().
+ *
+ * A sampling interval may check several adjacent page table entries (see
+ * &damon_ctx->max_ptes_per_sampling).  In that case @nr_accesses counts the
+ * accessed entries and @nr_samples counts all the entries checked, both over
+ * the current aggregation interval.  The access frequency is therefore
+ * @nr_accesses / @nr_samples.  @nr_samples is reset together with
+ * @nr_accesses.  A region having zero @nr_samples is treated as if it was
+ * sampled once per sampling interval.
  *
  * @nr_accesses_bp is another representation of @nr_accesses in basis point
  * (1 in 10,000) that updated for every &damon_attrs->sample_interval in a
@@ -77,11 +88,12 @@ struct damon_region {
 	struct damon_addr_range ar;
 	unsigned long sampling_addr;
 	unsigned int nr_accesses;
+	unsigned int nr_samples;
 	unsigned int nr_accesses_bp;
 	struct list_head list;
 
 	unsigned int age;
-/* private: Internal value for age calculation. */
+/* private: Internal value for age calculation.  Scaled like nr_accesses_bp. */
 	unsigned int last_nr_accesses;
 };
 
@@ -750,6 +762,10 @@ struct damon_attrs {
  * @ops:	Set of monitoring operations for given use cases.
  * @addr_unit:	Scale factor for core to ops address conversion.
  * @min_sz_region:		Minimum region size.
+ * @max_ptes_per_sampling:	Maximum number of adjacent page table entries
+ *			checked for one region in one sampling interval.  A
+ *			power of two in [1, %DAMON_MAX_PTES_PER_SAMPLING].
+ *			Virtual address monitoring only.  One by default.
  * @telescope:		Use accessed bits on non-leaf page tables when the
  *			region fully covers that level.  Virtual address
  *			monitoring only.  Off by default.
@@ -796,6 +812,7 @@ struct damon_ctx {
 	struct damon_operations ops;
 	unsigned long addr_unit;
 	unsigned long min_sz_region;
+	unsigned int max_ptes_per_sampling;
 	bool telescope;
 
 	struct list_head adaptive_targets;
@@ -886,6 +903,9 @@ void damon_add_region(struct damon_region *r, struct damon_target *t);
 void damon_destroy_region(struct damon_region *r, struct damon_target *t);
 int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
 		unsigned int nr_ranges, unsigned long min_sz_region);
+void damon_update_region_access_rate_samples(struct damon_region *r,
+		unsigned int nr_accessed, unsigned int nr_samples,
+		struct damon_attrs *attrs);
 void damon_update_region_access_rate(struct damon_region *r, bool accessed,
 		struct damon_attrs *attrs);
 
@@ -939,6 +959,34 @@ static inline unsigned int damon_max_nr_accesses(const struct damon_attrs *attrs
 	/* {aggr,sample}_interval are unsigned long, hence could overflow */
 	return min(attrs->aggr_interval / attrs->sample_interval,
 			(unsigned long)UINT_MAX);
+}
+
+#define DAMON_MAX_PTES_PER_SAMPLING	512
+
+int damon_region_level(struct damon_ctx *ctx, struct damon_region *r);
+
+/* Round @nr down to a power of two in [1, DAMON_MAX_PTES_PER_SAMPLING] */
+static inline unsigned int damon_sanitize_max_ptes(unsigned long nr)
+{
+	if (nr < 1)
+		return 1;
+	if (nr > DAMON_MAX_PTES_PER_SAMPLING)
+		return DAMON_MAX_PTES_PER_SAMPLING;
+	return rounddown_pow_of_two(nr);
+}
+
+/*
+ * Access frequency of a region in nr_accesses units: the number of sampling
+ * intervals of an aggregation interval in which the region would have been
+ * found accessed, if one entry was checked per sampling interval.
+ */
+static inline unsigned int damon_region_nr_accesses(
+		const struct damon_region *r, const struct damon_attrs *attrs)
+{
+	if (!r->nr_samples || !attrs->sample_interval)
+		return r->nr_accesses;
+	return div_u64((u64)r->nr_accesses * damon_max_nr_accesses(attrs),
+			r->nr_samples);
 }
 
 

@@ -113,7 +113,9 @@ static unsigned int damon_pa_check_accesses(struct damon_ctx *ctx)
 		damon_for_each_region(r, t) {
 			__damon_pa_check_access(
 					r, &ctx->attrs, ctx->addr_unit);
-			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
+			max_nr_accesses = max(
+					damon_region_nr_accesses(r, &ctx->attrs),
+					max_nr_accesses);
 		}
 	}
 

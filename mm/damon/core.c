@@ -129,6 +129,7 @@ struct damon_region *damon_new_region(unsigned long start, unsigned long end)
 	region->ar.start = start;
 	region->ar.end = end;
 	region->nr_accesses = 0;
+	region->nr_samples = 0;
 	region->nr_accesses_bp = 0;
 	INIT_LIST_HEAD(&region->list);
 
@@ -550,6 +551,7 @@ struct damon_ctx *damon_new_ctx(void)
 
 	ctx->addr_unit = 1;
 	ctx->min_sz_region = DAMON_MIN_REGION;
+	ctx->max_ptes_per_sampling = 1;
 
 	INIT_LIST_HEAD(&ctx->adaptive_targets);
 	INIT_LIST_HEAD(&ctx->schemes);
@@ -634,8 +636,15 @@ static void damon_update_monitoring_result(struct damon_region *r,
 		bool aggregating)
 {
 	if (!aggregating) {
+		/*
+		 * Express the access frequency as one sample per sampling
+		 * interval, in the new attrs.
+		 */
 		r->nr_accesses = damon_nr_accesses_for_new_attrs(
-				r->nr_accesses, old_attrs, new_attrs);
+				damon_region_nr_accesses(r, old_attrs),
+				old_attrs, new_attrs);
+		r->nr_samples = r->nr_samples ?
+			damon_max_nr_accesses(new_attrs) : 0;
 		r->nr_accesses_bp = r->nr_accesses * 10000;
 	} else {
 		/*
@@ -648,6 +657,7 @@ static void damon_update_monitoring_result(struct damon_region *r,
 				r->last_nr_accesses, old_attrs, new_attrs);
 		r->nr_accesses_bp = r->last_nr_accesses * 10000;
 		r->nr_accesses = 0;
+		r->nr_samples = 0;
 	}
 	r->age = damon_age_for_new_attrs(r->age, old_attrs, new_attrs);
 }
@@ -1258,6 +1268,7 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 	dst->addr_unit = src->addr_unit;
 	dst->min_sz_region = src->min_sz_region;
 	dst->telescope = src->telescope;
+	dst->max_ptes_per_sampling = src->max_ptes_per_sampling;
 
 	return 0;
 }
@@ -1510,13 +1521,22 @@ int damos_walk(struct damon_ctx *ctx, struct damos_walk_control *control)
  * Warn and fix corrupted ->nr_accesses[_bp] for investigations and preventing
  * the problem being propagated.
  */
-static void damon_warn_fix_nr_accesses_corruption(struct damon_region *r)
+static void damon_warn_fix_nr_accesses_corruption(struct damon_region *r,
+		struct damon_attrs *attrs)
 {
-	if (r->nr_accesses_bp == r->nr_accesses * 10000)
+	unsigned int nr_accesses = damon_region_nr_accesses(r, attrs);
+
+	if (r->nr_accesses_bp == nr_accesses * 10000)
 		return;
-	WARN_ONCE(true, "invalid nr_accesses_bp at reset: %u %u\n",
-			r->nr_accesses_bp, r->nr_accesses);
-	r->nr_accesses_bp = r->nr_accesses * 10000;
+	/*
+	 * If one entry was checked per sampling interval, ->nr_accesses_bp
+	 * must be exact.  Otherwise it is only an estimate of the scaled
+	 * ->nr_accesses, so silently make it exact.
+	 */
+	if (!r->nr_samples || r->nr_samples == damon_max_nr_accesses(attrs))
+		WARN_ONCE(true, "invalid nr_accesses_bp at reset: %u %u\n",
+				r->nr_accesses_bp, r->nr_accesses);
+	r->nr_accesses_bp = nr_accesses * 10000;
 }
 
 /*
@@ -1532,27 +1552,93 @@ static void kdamond_reset_aggregated(struct damon_ctx *c)
 
 		damon_for_each_region(r, t) {
 			trace_damon_aggregated(ti, r, damon_nr_regions(t));
-			damon_warn_fix_nr_accesses_corruption(r);
-			r->last_nr_accesses = r->nr_accesses;
+			damon_warn_fix_nr_accesses_corruption(r, &c->attrs);
+			r->last_nr_accesses =
+				damon_region_nr_accesses(r, &c->attrs);
 			r->nr_accesses = 0;
+			r->nr_samples = 0;
 		}
 		ti++;
 	}
 }
 
+/*
+ * Telescope profiles a region at the page table level that its boundaries
+ * allow: PUD if both are 1 GiB aligned, PMD if both are 2 MiB aligned, and the
+ * leaf PTE otherwise.  Levels are numbered like the vaddr ops does: 0 is the
+ * leaf, 1 is PMD, and 2 is PUD.
+ */
+static int damon_range_level(unsigned long start, unsigned long end)
+{
+	if (start >= end)
+		return 0;
+	if (IS_ALIGNED(start | end, PUD_SIZE))
+		return 2;
+	if (IS_ALIGNED(start | end, PMD_SIZE))
+		return 1;
+	return 0;
+}
+
+static bool damon_telescope_active(struct damon_ctx *ctx)
+{
+	return ctx->telescope && damon_target_has_pid(ctx) &&
+		arch_has_hw_nonleaf_pmd_young();
+}
+
+/**
+ * damon_region_level() - Page table level that a region is profiled at.
+ * @ctx:	The context of the region.
+ * @r:		The region.
+ *
+ * Return: 2 for PUD, 1 for PMD, 0 for the leaf PTE.  It is always 0 unless
+ * Telescope is on and usable.
+ */
+int damon_region_level(struct damon_ctx *ctx, struct damon_region *r)
+{
+	if (!damon_telescope_active(ctx))
+		return 0;
+	return damon_range_level(r->ar.start, r->ar.end);
+}
+
+/* Size of the entries that a region is profiled with */
+static unsigned long damon_region_unit(struct damon_ctx *ctx,
+		struct damon_region *r)
+{
+	switch (damon_region_level(ctx, r)) {
+	case 2:
+		return PUD_SIZE;
+	case 1:
+		return PMD_SIZE;
+	default:
+		return ctx->min_sz_region;
+	}
+}
+
+/*
+ * Score of how much the monitoring results hit the access_bp goal.  A region
+ * counts with the number of entries of its profiling level, since otherwise
+ * regions of different levels cannot be compared.  The hotness of the region
+ * is its nr_accesses / nr_samples.
+ */
 static unsigned long damon_get_intervals_score(struct damon_ctx *c)
 {
 	struct damon_target *t;
 	struct damon_region *r;
-	unsigned long sz_region, max_access_events = 0, access_events = 0;
+	unsigned long nr_units, max_access_events = 0, access_events = 0;
 	unsigned long target_access_events;
 	unsigned long goal_bp = c->attrs.intervals_goal.access_bp;
+	unsigned long nr_samples;
 
 	damon_for_each_target(t, c) {
 		damon_for_each_region(r, t) {
-			sz_region = damon_sz_region(r);
-			max_access_events += sz_region * c->attrs.aggr_samples;
-			access_events += sz_region * r->nr_accesses;
+			nr_units = max(1UL, damon_sz_region(r) /
+					damon_region_unit(c, r));
+			nr_samples = r->nr_samples ?
+				r->nr_samples : c->attrs.aggr_samples;
+			max_access_events += nr_units * 10000;
+			access_events += nr_units * min((u64)10000,
+					(u64)r->nr_accesses * 10000 /
+					nr_samples);
 		}
 	}
 	target_access_events = max_access_events * goal_bp / 10000;
@@ -1603,6 +1689,111 @@ static void kdamond_tune_intervals(struct damon_ctx *c)
 
 static void damon_split_region_at(struct damon_target *t,
 				  struct damon_region *r, unsigned long sz_r);
+
+/*
+ * Cut [@start, @end) into the regions Telescope profiles at the highest
+ * levels possible.  The part of the range that is 1 GiB aligned is one PUD
+ * level region, and what is left of the range on either side is cut again at
+ * PMD level.  The 2 MiB aligned part of that is one PMD level region, and the
+ * unaligned ends are leaf level regions.  The pieces are stored in @out, in
+ * order.  Return the number of the pieces, at most five.
+ */
+static unsigned int damon_pmd_pieces(unsigned long start, unsigned long end,
+		struct damon_addr_range *out, unsigned int n)
+{
+	unsigned long ps = ALIGN(start, PMD_SIZE);
+	unsigned long pe = ALIGN_DOWN(end, PMD_SIZE);
+
+	if (start >= end)
+		return n;
+	if (ps >= pe) {
+		out[n].start = start;
+		out[n++].end = end;
+		return n;
+	}
+	if (start < ps) {
+		out[n].start = start;
+		out[n++].end = ps;
+	}
+	out[n].start = ps;
+	out[n++].end = pe;
+	if (pe < end) {
+		out[n].start = pe;
+		out[n++].end = end;
+	}
+	return n;
+}
+
+static unsigned int damon_telescope_pieces(unsigned long start,
+		unsigned long end, struct damon_addr_range *out)
+{
+	unsigned long us = ALIGN(start, PUD_SIZE);
+	unsigned long ue = ALIGN_DOWN(end, PUD_SIZE);
+	unsigned int n = 0;
+
+	if (us >= ue)
+		return damon_pmd_pieces(start, end, out, n);
+
+	n = damon_pmd_pieces(start, us, out, n);
+	out[n].start = us;
+	out[n++].end = ue;
+	return damon_pmd_pieces(ue, end, out, n);
+}
+
+/*
+ * Cut @r into the regions that its boundaries allow Telescope to profile at.
+ * Return the last of the regions, which is @r itself if it needed no cut.
+ */
+static struct damon_region *damon_normalize_region(struct damon_ctx *ctx,
+		struct damon_target *t, struct damon_region *r)
+{
+	struct damon_addr_range pieces[5];
+	unsigned int i, n;
+
+	if (!damon_telescope_active(ctx))
+		return r;
+
+	n = damon_telescope_pieces(r->ar.start, r->ar.end, pieces);
+	for (i = 0; i < n - 1; i++) {
+		damon_split_region_at(t, r, pieces[i].end - pieces[i].start);
+		/* Out of memory.  The region will be tried again later. */
+		if (r->ar.end != pieces[i].end)
+			return r;
+		r = damon_next_region(r);
+	}
+	return r;
+}
+
+/* Make every region of the context have the boundaries of its level */
+static void kdamond_normalize_regions(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct damon_region *r, *next;
+
+	if (!damon_telescope_active(ctx))
+		return;
+	damon_for_each_target(t, ctx)
+		damon_for_each_region_safe(r, next, t)
+			damon_normalize_region(ctx, t, r);
+}
+
+/*
+ * Whether merging two regions is useful.  The regions that Telescope profiles
+ * at a level must have boundaries of the level, so a merged region is cut
+ * again.  If that gives back the same two regions, the merge only mixes their
+ * access counts.
+ */
+static bool damon_merge_is_useful(struct damon_ctx *ctx,
+		struct damon_region *l, struct damon_region *r)
+{
+	struct damon_addr_range pieces[5];
+	unsigned int n;
+
+	if (!damon_telescope_active(ctx))
+		return true;
+	n = damon_telescope_pieces(l->ar.start, r->ar.end, pieces);
+	return !(n == 2 && pieces[0].end == l->ar.end);
+}
 
 static bool __damos_valid_target(struct damon_region *r, struct damos *s)
 {
@@ -2240,13 +2431,16 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
  * Merge two adjacent regions into one region
  */
 static void damon_merge_two_regions(struct damon_target *t,
-		struct damon_region *l, struct damon_region *r)
+		struct damon_attrs *attrs, struct damon_region *l,
+		struct damon_region *r)
 {
 	unsigned long sz_l = damon_sz_region(l), sz_r = damon_sz_region(r);
 
 	l->nr_accesses = (l->nr_accesses * sz_l + r->nr_accesses * sz_r) /
 			(sz_l + sz_r);
-	l->nr_accesses_bp = l->nr_accesses * 10000;
+	l->nr_samples = (l->nr_samples * sz_l + r->nr_samples * sz_r) /
+			(sz_l + sz_r);
+	l->nr_accesses_bp = damon_region_nr_accesses(l, attrs) * 10000;
 	l->age = (l->age * sz_l + r->age * sz_r) / (sz_l + sz_r);
 	l->ar.end = r->ar.end;
 	damon_destroy_region(r, t);
@@ -2255,29 +2449,38 @@ static void damon_merge_two_regions(struct damon_target *t,
 /*
  * Merge adjacent regions having similar access frequencies
  *
+ * ctx		context of the target
  * t		target affected by this merge operation
  * thres	'->nr_accesses' diff threshold for the merge
  * sz_limit	size upper limit of each region
  */
-static void damon_merge_regions_of(struct damon_target *t, unsigned int thres,
-				   unsigned long sz_limit)
+static void damon_merge_regions_of(struct damon_ctx *ctx,
+		struct damon_target *t, unsigned int thres,
+		unsigned long sz_limit)
 {
+	struct damon_attrs *attrs = &ctx->attrs;
 	struct damon_region *r, *prev = NULL, *next;
 
 	damon_for_each_region_safe(r, next, t) {
-		if (abs(r->nr_accesses - r->last_nr_accesses) > thres)
+		unsigned int nr_accesses = damon_region_nr_accesses(r, attrs);
+
+		if (abs(nr_accesses - r->last_nr_accesses) > thres)
 			r->age = 0;
-		else if ((r->nr_accesses == 0) != (r->last_nr_accesses == 0))
+		else if ((nr_accesses == 0) != (r->last_nr_accesses == 0))
 			r->age = 0;
 		else
 			r->age++;
 
 		if (prev && prev->ar.end == r->ar.start &&
-		    abs(prev->nr_accesses - r->nr_accesses) <= thres &&
-		    damon_sz_region(prev) + damon_sz_region(r) <= sz_limit)
-			damon_merge_two_regions(t, prev, r);
-		else
+		    abs(damon_region_nr_accesses(prev, attrs) - nr_accesses) <=
+		    thres &&
+		    damon_sz_region(prev) + damon_sz_region(r) <= sz_limit &&
+		    damon_merge_is_useful(ctx, prev, r)) {
+			damon_merge_two_regions(t, attrs, prev, r);
+			prev = damon_normalize_region(ctx, t, prev);
+		} else {
 			prev = r;
+		}
 	}
 }
 
@@ -2310,7 +2513,7 @@ static void kdamond_merge_regions(struct damon_ctx *c, unsigned int threshold,
 	do {
 		nr_regions = 0;
 		damon_for_each_target(t, c) {
-			damon_merge_regions_of(t, threshold, sz_limit);
+			damon_merge_regions_of(c, t, threshold, sz_limit);
 			nr_regions += damon_nr_regions(t);
 		}
 		threshold = max(1, threshold * 2);
@@ -2339,35 +2542,64 @@ static void damon_split_region_at(struct damon_target *t,
 	new->last_nr_accesses = r->last_nr_accesses;
 	new->nr_accesses_bp = r->nr_accesses_bp;
 	new->nr_accesses = r->nr_accesses;
+	new->nr_samples = r->nr_samples;
 
 	damon_insert_region(new, r, damon_next_region(r), t);
 }
 
 /* Split every region in the given target into 'nr_subs' regions */
-static void damon_split_regions_of(struct damon_target *t, int nr_subs,
-				  unsigned long min_sz_region)
+/*
+ * Granularity of the split of a region.  A region profiled at a level is split
+ * at the boundaries of that level.  If it is only one entry of the level, it
+ * is split at the boundaries of the next level down.
+ */
+static unsigned long damon_split_granule(struct damon_ctx *ctx,
+		struct damon_region *r)
+{
+	unsigned long sz = damon_sz_region(r);
+
+	switch (damon_region_level(ctx, r)) {
+	case 2:
+		return sz > PUD_SIZE ? PUD_SIZE : PMD_SIZE;
+	case 1:
+		return sz > PMD_SIZE ? PMD_SIZE : ctx->min_sz_region;
+	default:
+		return ctx->min_sz_region;
+	}
+}
+
+static void damon_split_regions_of(struct damon_ctx *ctx,
+		struct damon_target *t, int nr_subs)
 {
 	struct damon_region *r, *next;
-	unsigned long sz_region, sz_sub = 0;
+	unsigned long sz_region, sz_sub = 0, granule;
 	int i;
 
 	damon_for_each_region_safe(r, next, t) {
 		sz_region = damon_sz_region(r);
+		granule = damon_split_granule(ctx, r);
 
+		/*
+		 * A region of coarser granularity can be split in two parts
+		 * of one entry each.  Leaf regions keep the legacy bound.
+		 */
 		for (i = 0; i < nr_subs - 1 &&
-				sz_region > 2 * min_sz_region; i++) {
+				(granule > ctx->min_sz_region ?
+				 sz_region >= 2 * granule :
+				 sz_region > 2 * granule); i++) {
 			/*
 			 * Randomly select size of left sub-region to be at
 			 * least 10 percent and at most 90% of original region
 			 */
 			sz_sub = ALIGN_DOWN(damon_rand(1, 10) *
-					sz_region / 10, min_sz_region);
+					sz_region / 10, granule);
 			/* Do not allow blank region */
 			if (sz_sub == 0 || sz_sub >= sz_region)
 				continue;
 
 			damon_split_region_at(t, r, sz_sub);
 			sz_region = sz_sub;
+			granule = damon_split_granule(ctx, r);
 		}
 	}
 }
@@ -2401,7 +2633,7 @@ static void kdamond_split_regions(struct damon_ctx *ctx)
 		nr_subregions = 3;
 
 	damon_for_each_target(t, ctx)
-		damon_split_regions_of(t, nr_subregions, ctx->min_sz_region);
+		damon_split_regions_of(ctx, t, nr_subregions);
 
 	last_nr_regions = nr_regions;
 }
@@ -2623,6 +2855,9 @@ static int kdamond_fn(void *data)
 
 		if (kdamond_wait_activation(ctx))
 			break;
+
+		/* Regions set by anyone but the merge and split are cut here */
+		kdamond_normalize_regions(ctx);
 
 		if (ctx->ops.prepare_access_checks)
 			ctx->ops.prepare_access_checks(ctx);
@@ -2851,7 +3086,27 @@ static unsigned int damon_moving_sum(unsigned int mvsum, unsigned int nomvsum,
 void damon_update_region_access_rate(struct damon_region *r, bool accessed,
 		struct damon_attrs *attrs)
 {
+	damon_update_region_access_rate_samples(r, accessed, 1, attrs);
+}
+
+/**
+ * damon_update_region_access_rate_samples() - Update the access rate of a
+ * region with the access checks of several entries.
+ * @r:		The region to update.
+ * @nr_accessed:	Number of the checked entries found accessed.
+ * @nr_samples:	Number of the entries checked.
+ * @attrs:	The monitoring attributes of the context.
+ *
+ * Update the access rate of a region with the last sampling interval access
+ * check result, which checked @nr_samples entries.  The region's access
+ * frequency is @nr_accesses / @nr_samples over an aggregation interval.
+ */
+void damon_update_region_access_rate_samples(struct damon_region *r,
+		unsigned int nr_accessed, unsigned int nr_samples,
+		struct damon_attrs *attrs)
+{
 	unsigned int len_window = 1;
+	unsigned int accessed_bp = 0;
 
 	/*
 	 * sample_interval can be zero, but cannot be larger than
@@ -2859,12 +3114,14 @@ void damon_update_region_access_rate(struct damon_region *r, bool accessed,
 	 */
 	if (attrs->sample_interval)
 		len_window = damon_max_nr_accesses(attrs);
+	if (nr_samples)
+		accessed_bp = (u64)nr_accessed * 10000 / nr_samples;
 	r->nr_accesses_bp = damon_moving_sum(r->nr_accesses_bp,
 			r->last_nr_accesses * 10000, len_window,
-			accessed ? 10000 : 0);
+			accessed_bp);
 
-	if (accessed)
-		r->nr_accesses++;
+	r->nr_accesses += nr_accessed;
+	r->nr_samples += nr_samples;
 }
 
 /**
