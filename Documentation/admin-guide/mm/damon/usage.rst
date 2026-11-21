@@ -217,6 +217,12 @@ next level down.  Write the file, then commit the inputs or start the
 kdamond, the same way as the other context parameters.  The file has no
 effect on physical-address monitoring.
 
+Telescope also works on hugetlb mappings.  A hugetlb page that is as large as
+the sampled level (a 1 GiB page at the PUD level, a 2 MiB page at the PMD
+level) is sampled from its own entry.  A 2 MiB hugetlb page sampled at the PUD
+level reads the accessed bit of the PUD entry that points to its PMD table.
+Transparent hugepages are ordinary PMD entries and need no special handling.
+
 .. _sysfs_monitoring_attrs:
 
 contexts/<N>/monitoring_attrs/
