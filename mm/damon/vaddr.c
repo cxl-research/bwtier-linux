@@ -24,6 +24,30 @@
 #endif
 
 /*
+ * Page-table level to sample.  0 is the leaf PTE, 1 is PMD, 2 is PUD.
+ * A level is usable only when Telescope is on, the CPU maintains accessed
+ * bits on non-leaf entries, and the sampling address's entry at that level
+ * lies entirely inside the region.  Smaller regions therefore fall through
+ * to lower levels.
+ */
+static int damon_va_profile_level(struct damon_ctx *ctx, unsigned long start,
+		unsigned long end, unsigned long addr)
+{
+	if (!ctx->telescope || !arch_has_hw_nonleaf_pmd_young())
+		return 0;
+
+	if (pmd_addr_start(addr, start - 1) < start ||
+			pmd_addr_end(addr, end + 1) > end)
+		return 0;
+
+	if (pud_addr_start(addr, start - 1) < start ||
+			pud_addr_end(addr, end + 1) > end)
+		return 1;
+
+	return 2;
+}
+
+/*
  * 't->pid' should be the pointer to the relevant 'struct pid' having reference
  * count.  Caller must put the returned task, unless it is NULL.
  */
@@ -389,16 +413,64 @@ out:
 #define damon_mkold_hugetlb_entry NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
-static const struct mm_walk_ops damon_mkold_ops = {
-	.pmd_entry = damon_mkold_pmd_entry,
-	.hugetlb_entry = damon_mkold_hugetlb_entry,
-	.walk_lock = PGWALK_RDLOCK,
+static int damon_mkold_pmd(pmd_t *pmd, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+	pmd_t pmde;
+
+	ptl = pmd_lock(walk->mm, pmd);
+	pmde = pmdp_get(pmd);
+	if (!pmd_present(pmde)) {
+		spin_unlock(ptl);
+		return 0;
+	}
+	pmdp_clear_young_notify(walk->vma, addr, pmd);
+	spin_unlock(ptl);
+	return 0;
+}
+
+static int damon_mkold_pud(pud_t *pud, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+	pud_t pude;
+
+	ptl = pud_lock(walk->mm, pud);
+	pude = pudp_get(pud);
+	if (!pud_present(pude)) {
+		spin_unlock(ptl);
+		return 0;
+	}
+	pudp_clear_young_notify(walk->vma, addr, pud);
+	spin_unlock(ptl);
+	return 0;
+}
+
+static const struct mm_walk_ops damon_mkold_ops[] = {
+	{
+		.pmd_entry = damon_mkold_pmd_entry,
+		.hugetlb_entry = damon_mkold_hugetlb_entry,
+		.walk_lock = PGWALK_RDLOCK,
+	},
+	{
+		.pmd_entry = damon_mkold_pmd,
+		.walk_lock = PGWALK_RDLOCK,
+	},
+	{
+		.pud_entry = damon_mkold_pud,
+		.walk_lock = PGWALK_RDLOCK,
+	},
 };
 
-static void damon_va_mkold(struct mm_struct *mm, unsigned long addr)
+static void damon_va_mkold(struct damon_ctx *ctx, struct mm_struct *mm,
+		struct damon_region *r)
 {
+	unsigned long addr = r->sampling_addr;
+	int level = damon_va_profile_level(ctx, r->ar.start, r->ar.end, addr);
+
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops, NULL);
+	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops[level], NULL);
 	mmap_read_unlock(mm);
 }
 
@@ -406,12 +478,12 @@ static void damon_va_mkold(struct mm_struct *mm, unsigned long addr)
  * Functions for the access checking of the regions
  */
 
-static void __damon_va_prepare_access_check(struct mm_struct *mm,
-					struct damon_region *r)
+static void __damon_va_prepare_access_check(struct damon_ctx *ctx,
+		struct mm_struct *mm, struct damon_region *r)
 {
 	r->sampling_addr = damon_rand(r->ar.start, r->ar.end);
 
-	damon_va_mkold(mm, r->sampling_addr);
+	damon_va_mkold(ctx, mm, r);
 }
 
 static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
@@ -425,7 +497,7 @@ static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
 		if (!mm)
 			continue;
 		damon_for_each_region(r, t)
-			__damon_va_prepare_access_check(mm, r);
+			__damon_va_prepare_access_check(ctx, mm, r);
 		mmput(mm);
 	}
 }
@@ -531,22 +603,74 @@ out:
 #define damon_young_hugetlb_entry NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
-static const struct mm_walk_ops damon_young_ops = {
-	.pmd_entry = damon_young_pmd_entry,
-	.hugetlb_entry = damon_young_hugetlb_entry,
-	.walk_lock = PGWALK_RDLOCK,
+static int damon_young_pmd(pmd_t *pmd, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	struct damon_young_walk_private *priv = walk->private;
+	spinlock_t *ptl;
+	pmd_t pmde;
+
+	ptl = pmd_lock(walk->mm, pmd);
+	pmde = pmdp_get(pmd);
+	if (!pmd_present(pmde)) {
+		spin_unlock(ptl);
+		return 0;
+	}
+	if (pmd_young(pmde) || mmu_notifier_test_young(walk->mm, addr))
+		priv->young = true;
+	*priv->folio_sz = PMD_SIZE;
+	spin_unlock(ptl);
+	return 0;
+}
+
+static int damon_young_pud(pud_t *pud, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	struct damon_young_walk_private *priv = walk->private;
+	spinlock_t *ptl;
+	pud_t pude;
+
+	ptl = pud_lock(walk->mm, pud);
+	pude = pudp_get(pud);
+	if (!pud_present(pude)) {
+		spin_unlock(ptl);
+		return 0;
+	}
+	if (pud_young(pude) || mmu_notifier_test_young(walk->mm, addr))
+		priv->young = true;
+	*priv->folio_sz = PUD_SIZE;
+	spin_unlock(ptl);
+	return 0;
+}
+
+static const struct mm_walk_ops damon_young_ops[] = {
+	{
+		.pmd_entry = damon_young_pmd_entry,
+		.hugetlb_entry = damon_young_hugetlb_entry,
+		.walk_lock = PGWALK_RDLOCK,
+	},
+	{
+		.pmd_entry = damon_young_pmd,
+		.walk_lock = PGWALK_RDLOCK,
+	},
+	{
+		.pud_entry = damon_young_pud,
+		.walk_lock = PGWALK_RDLOCK,
+	},
 };
 
-static bool damon_va_young(struct mm_struct *mm, unsigned long addr,
-		unsigned long *folio_sz)
+static bool damon_va_young(struct damon_ctx *ctx, struct mm_struct *mm,
+		struct damon_region *r, unsigned long *folio_sz)
 {
+	unsigned long addr = r->sampling_addr;
+	int level = damon_va_profile_level(ctx, r->ar.start, r->ar.end, addr);
 	struct damon_young_walk_private arg = {
 		.folio_sz = folio_sz,
 		.young = false,
 	};
 
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_young_ops, &arg);
+	walk_page_range(mm, addr, addr + 1, &damon_young_ops[level], &arg);
 	mmap_read_unlock(mm);
 	return arg.young;
 }
@@ -557,9 +681,9 @@ static bool damon_va_young(struct mm_struct *mm, unsigned long addr,
  * mm	'mm_struct' for the given virtual address space
  * r	the region to be checked
  */
-static void __damon_va_check_access(struct mm_struct *mm,
-				struct damon_region *r, bool same_target,
-				struct damon_attrs *attrs)
+static void __damon_va_check_access(struct damon_ctx *ctx,
+		struct mm_struct *mm, struct damon_region *r, bool same_target,
+		struct damon_attrs *attrs)
 {
 	static unsigned long last_addr;
 	static unsigned long last_folio_sz = PAGE_SIZE;
@@ -577,7 +701,7 @@ static void __damon_va_check_access(struct mm_struct *mm,
 		return;
 	}
 
-	last_accessed = damon_va_young(mm, r->sampling_addr, &last_folio_sz);
+	last_accessed = damon_va_young(ctx, mm, r, &last_folio_sz);
 	damon_update_region_access_rate(r, last_accessed, attrs);
 
 	last_addr = r->sampling_addr;
@@ -595,7 +719,7 @@ static unsigned int damon_va_check_accesses(struct damon_ctx *ctx)
 		mm = damon_get_mm(t);
 		same_target = false;
 		damon_for_each_region(r, t) {
-			__damon_va_check_access(mm, r, same_target,
+			__damon_va_check_access(ctx, mm, r, same_target,
 					&ctx->attrs);
 			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
 			same_target = true;

@@ -563,6 +563,17 @@ static inline void mmu_notifier_range_init_owner(
 	__young;							\
 })
 
+#define pudp_clear_young_notify(__vma, __address, __pudp)		\
+({									\
+	int __young;							\
+	struct vm_area_struct *___vma = __vma;				\
+	unsigned long ___address = __address;				\
+	__young = pudp_test_and_clear_young(___vma, ___address, __pudp);\
+	__young |= mmu_notifier_clear_young(___vma->vm_mm, ___address,	\
+					    ___address + PUD_SIZE);	\
+	__young;							\
+})
+
 #else /* CONFIG_MMU_NOTIFIER */
 
 struct mmu_notifier_range {
@@ -654,6 +665,7 @@ static inline void mmu_notifier_subscriptions_destroy(struct mm_struct *mm)
 #define pmdp_clear_flush_young_notify pmdp_clear_flush_young
 #define ptep_clear_young_notify ptep_test_and_clear_young
 #define pmdp_clear_young_notify pmdp_test_and_clear_young
+#define pudp_clear_young_notify pudp_test_and_clear_young
 
 static inline void mmu_notifier_synchronize(void)
 {

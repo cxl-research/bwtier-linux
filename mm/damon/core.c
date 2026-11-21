@@ -1257,6 +1257,7 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 	dst->ops = src->ops;
 	dst->addr_unit = src->addr_unit;
 	dst->min_sz_region = src->min_sz_region;
+	dst->telescope = src->telescope;
 
 	return 0;
 }
