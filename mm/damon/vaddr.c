@@ -409,8 +409,50 @@ out:
 	spin_unlock(ptl);
 	return 0;
 }
+
+/*
+ * walk_page_range() never reaches pud_entry on a hugetlb VMA, so telescope's
+ * PUD level finds the PUD entry from the hugetlb callback.
+ */
+static pud_t *damon_hugetlb_pudp(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t *pgd = pgd_offset(mm, addr);
+	p4d_t *p4d;
+
+	if (!pgd_present(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, addr);
+	if (!p4d_present(*p4d))
+		return NULL;
+	return pud_offset(p4d, addr);
+}
+
+static int damon_mkold_hugetlb_pud(pte_t *pte, unsigned long hmask,
+				   unsigned long addr, unsigned long end,
+				   struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+	pud_t *pud;
+	pud_t pude;
+
+	/* A 1 GiB hugetlb page: the PUD entry is the leaf. */
+	if (huge_page_size(hstate_vma(walk->vma)) >= PUD_SIZE)
+		return damon_mkold_hugetlb_entry(pte, hmask, addr, end, walk);
+
+	/* A smaller hugetlb page: the PUD entry points to a PMD table. */
+	pud = damon_hugetlb_pudp(walk->mm, addr);
+	if (!pud)
+		return 0;
+	ptl = pud_lock(walk->mm, pud);
+	pude = pudp_get(pud);
+	if (pud_present(pude) && !pud_leaf(pude))
+		pudp_clear_young_notify(walk->vma, addr, pud);
+	spin_unlock(ptl);
+	return 0;
+}
 #else
 #define damon_mkold_hugetlb_entry NULL
+#define damon_mkold_hugetlb_pud NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
 static int damon_mkold_pmd(pmd_t *pmd, unsigned long addr,
@@ -455,10 +497,12 @@ static const struct mm_walk_ops damon_mkold_ops[] = {
 	},
 	{
 		.pmd_entry = damon_mkold_pmd,
+		.hugetlb_entry = damon_mkold_hugetlb_entry,
 		.walk_lock = PGWALK_RDLOCK,
 	},
 	{
 		.pud_entry = damon_mkold_pud,
+		.hugetlb_entry = damon_mkold_hugetlb_pud,
 		.walk_lock = PGWALK_RDLOCK,
 	},
 };
@@ -599,8 +643,37 @@ out:
 	spin_unlock(ptl);
 	return 0;
 }
+
+static int damon_young_hugetlb_pud(pte_t *pte, unsigned long hmask,
+				   unsigned long addr, unsigned long end,
+				   struct mm_walk *walk)
+{
+	struct damon_young_walk_private *priv = walk->private;
+	spinlock_t *ptl;
+	pud_t *pud;
+	pud_t pude;
+
+	/* A 1 GiB hugetlb page: the PUD entry is the leaf. */
+	if (huge_page_size(hstate_vma(walk->vma)) >= PUD_SIZE)
+		return damon_young_hugetlb_entry(pte, hmask, addr, end, walk);
+
+	/* A smaller hugetlb page: the PUD entry points to a PMD table. */
+	pud = damon_hugetlb_pudp(walk->mm, addr);
+	if (!pud)
+		return 0;
+	ptl = pud_lock(walk->mm, pud);
+	pude = pudp_get(pud);
+	if (pud_present(pude) && !pud_leaf(pude)) {
+		if (pud_young(pude) || mmu_notifier_test_young(walk->mm, addr))
+			priv->young = true;
+		*priv->folio_sz = PUD_SIZE;
+	}
+	spin_unlock(ptl);
+	return 0;
+}
 #else
 #define damon_young_hugetlb_entry NULL
+#define damon_young_hugetlb_pud NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
 static int damon_young_pmd(pmd_t *pmd, unsigned long addr,
@@ -651,10 +724,12 @@ static const struct mm_walk_ops damon_young_ops[] = {
 	},
 	{
 		.pmd_entry = damon_young_pmd,
+		.hugetlb_entry = damon_young_hugetlb_entry,
 		.walk_lock = PGWALK_RDLOCK,
 	},
 	{
 		.pud_entry = damon_young_pud,
+		.hugetlb_entry = damon_young_hugetlb_pud,
 		.walk_lock = PGWALK_RDLOCK,
 	},
 };
