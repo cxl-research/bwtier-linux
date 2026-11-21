@@ -128,6 +128,7 @@ static void damon_test_split_at(struct kunit *test)
 	r = damon_new_region(0, 100);
 	r->nr_accesses_bp = 420000;
 	r->nr_accesses = 42;
+	r->nr_samples = 84;
 	r->last_nr_accesses = 15;
 	damon_add_region(r, t);
 	damon_split_region_at(t, r, 25);
@@ -140,6 +141,7 @@ static void damon_test_split_at(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, r->nr_accesses_bp, r_new->nr_accesses_bp);
 	KUNIT_EXPECT_EQ(test, r->nr_accesses, r_new->nr_accesses);
+	KUNIT_EXPECT_EQ(test, r->nr_samples, r_new->nr_samples);
 	KUNIT_EXPECT_EQ(test, r->last_nr_accesses, r_new->last_nr_accesses);
 
 	damon_free_target(t);
@@ -148,6 +150,10 @@ static void damon_test_split_at(struct kunit *test)
 
 static void damon_test_merge_two(struct kunit *test)
 {
+	struct damon_attrs attrs = {
+		.sample_interval = 1000,
+		.aggr_interval = 100000,
+	};
 	struct damon_target *t;
 	struct damon_region *r, *r2, *r3;
 	int i;
@@ -162,7 +168,7 @@ static void damon_test_merge_two(struct kunit *test)
 	r2->nr_accesses_bp = 200000;
 	damon_add_region(r2, t);
 
-	damon_merge_two_regions(t, r, r2);
+	damon_merge_two_regions(t, &attrs, r, r2);
 	KUNIT_EXPECT_EQ(test, r->ar.start, 0ul);
 	KUNIT_EXPECT_EQ(test, r->ar.end, 300ul);
 	KUNIT_EXPECT_EQ(test, r->nr_accesses, 16u);
@@ -173,6 +179,37 @@ static void damon_test_merge_two(struct kunit *test)
 		i++;
 	}
 	KUNIT_EXPECT_EQ(test, i, 1);
+
+	damon_free_target(t);
+}
+
+static void damon_test_merge_two_samples(struct kunit *test)
+{
+	struct damon_attrs attrs = {
+		.sample_interval = 1000,
+		.aggr_interval = 100000,
+	};
+	struct damon_target *t;
+	struct damon_region *r, *r2;
+
+	t = damon_new_target();
+	r = damon_new_region(0, 100);
+	r->nr_accesses = 50;
+	r->nr_samples = 200;
+	damon_add_region(r, t);
+	r2 = damon_new_region(100, 300);
+	r2->nr_accesses = 400;
+	r2->nr_samples = 800;
+	damon_add_region(r2, t);
+
+	/* 25% and 50%, in nr_accesses units of the max (100) */
+	KUNIT_EXPECT_EQ(test, damon_region_nr_accesses(r, &attrs), 25u);
+	KUNIT_EXPECT_EQ(test, damon_region_nr_accesses(r2, &attrs), 50u);
+
+	damon_merge_two_regions(t, &attrs, r, r2);
+	KUNIT_EXPECT_EQ(test, r->nr_accesses, 283u);
+	KUNIT_EXPECT_EQ(test, r->nr_samples, 600u);
+	KUNIT_EXPECT_EQ(test, r->nr_accesses_bp, 47u * 10000);
 
 	damon_free_target(t);
 }
@@ -192,6 +229,7 @@ static struct damon_region *__nth_region_of(struct damon_target *t, int idx)
 
 static void damon_test_merge_regions_of(struct kunit *test)
 {
+	struct damon_ctx *c = damon_new_ctx();
 	struct damon_target *t;
 	struct damon_region *r;
 	unsigned long sa[] = {0, 100, 114, 122, 130, 156, 170, 184};
@@ -210,7 +248,7 @@ static void damon_test_merge_regions_of(struct kunit *test)
 		damon_add_region(r, t);
 	}
 
-	damon_merge_regions_of(t, 9, 9999);
+	damon_merge_regions_of(c, t, 9, 9999);
 	/* 0-112, 114-130, 130-156, 156-170 */
 	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), 5u);
 	for (i = 0; i < 5; i++) {
@@ -219,6 +257,55 @@ static void damon_test_merge_regions_of(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, r->ar.end, eaddrs[i]);
 	}
 	damon_free_target(t);
+	damon_destroy_ctx(c);
+}
+
+static void __test_telescope_pieces(struct kunit *test, unsigned long start,
+		unsigned long end, unsigned int nr, unsigned long *bounds)
+{
+	struct damon_addr_range pieces[5];
+	unsigned int i, n = damon_telescope_pieces(start, end, pieces);
+
+	KUNIT_ASSERT_EQ(test, n, nr);
+	for (i = 0; i < n; i++) {
+		KUNIT_EXPECT_EQ(test, pieces[i].start, bounds[i]);
+		KUNIT_EXPECT_EQ(test, pieces[i].end, bounds[i + 1]);
+	}
+}
+
+static void damon_test_telescope_pieces(struct kunit *test)
+{
+	unsigned long pg = PAGE_SIZE;
+	unsigned long pmd = PMD_SIZE, pud = PUD_SIZE;
+	unsigned long b1[] = {pmd / 2, pmd, 2 * pmd, 5 * pmd / 2};
+	unsigned long b2[] = {0, 3 * pud};
+	unsigned long b3[] = {pud / 2, pud, 2 * pud, 5 * pud / 2};
+	unsigned long b4[] = {pmd / 2 + pg, pmd, pud, 2 * pud,
+		5 * pud / 2, 5 * pud / 2 + 2 * pg};
+	unsigned long b5[] = {pg, pmd + pg};
+
+	/* A 2 MiB entry inside the region is cut out */
+	__test_telescope_pieces(test, pmd / 2, 5 * pmd / 2, 3, b1);
+	/* Whole PUDs are one region */
+	__test_telescope_pieces(test, 0, 3 * pud, 1, b2);
+	/* PUD in the middle, PMD level regions on both sides */
+	__test_telescope_pieces(test, pud / 2, 5 * pud / 2, 3, b3);
+	/* Five regions, with leaf level regions on both ends */
+	__test_telescope_pieces(test, pmd / 2 + pg, 5 * pud / 2 + 2 * pg, 5,
+			b4);
+	/* Less than a PMD aligned entry stays one leaf level region */
+	__test_telescope_pieces(test, pg, pmd + pg, 1, b5);
+}
+
+static void damon_test_range_level(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, damon_range_level(0, PUD_SIZE), 2);
+	KUNIT_EXPECT_EQ(test, damon_range_level(PUD_SIZE, 3 * PUD_SIZE), 2);
+	KUNIT_EXPECT_EQ(test, damon_range_level(PUD_SIZE - PMD_SIZE,
+				2 * PUD_SIZE), 1);
+	KUNIT_EXPECT_EQ(test, damon_range_level(PMD_SIZE, 3 * PMD_SIZE), 1);
+	KUNIT_EXPECT_EQ(test, damon_range_level(PAGE_SIZE, PMD_SIZE), 0);
+	KUNIT_EXPECT_EQ(test, damon_range_level(0, PAGE_SIZE), 0);
 }
 
 static void damon_test_split_regions_of(struct kunit *test)
@@ -230,14 +317,14 @@ static void damon_test_split_regions_of(struct kunit *test)
 	t = damon_new_target();
 	r = damon_new_region(0, 22);
 	damon_add_region(r, t);
-	damon_split_regions_of(t, 2, DAMON_MIN_REGION);
+	damon_split_regions_of(c, t, 2);
 	KUNIT_EXPECT_LE(test, damon_nr_regions(t), 2u);
 	damon_free_target(t);
 
 	t = damon_new_target();
 	r = damon_new_region(0, 220);
 	damon_add_region(r, t);
-	damon_split_regions_of(t, 4, DAMON_MIN_REGION);
+	damon_split_regions_of(c, t, 4);
 	KUNIT_EXPECT_LE(test, damon_nr_regions(t), 4u);
 	damon_free_target(t);
 	damon_destroy_ctx(c);
@@ -606,8 +693,11 @@ static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_aggregate),
 	KUNIT_CASE(damon_test_split_at),
 	KUNIT_CASE(damon_test_merge_two),
+	KUNIT_CASE(damon_test_merge_two_samples),
 	KUNIT_CASE(damon_test_merge_regions_of),
 	KUNIT_CASE(damon_test_split_regions_of),
+	KUNIT_CASE(damon_test_telescope_pieces),
+	KUNIT_CASE(damon_test_range_level),
 	KUNIT_CASE(damon_test_ops_registration),
 	KUNIT_CASE(damon_test_set_regions),
 	KUNIT_CASE(damon_test_nr_accesses_to_accesses_bp),

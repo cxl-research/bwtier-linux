@@ -61,7 +61,7 @@ comma (",").
     │ :ref:`kdamonds <sysfs_kdamonds>`/nr_kdamonds
     │ │ :ref:`0 <sysfs_kdamond>`/state,pid,refresh_ms
     │ │ │ :ref:`contexts <sysfs_contexts>`/nr_contexts
-    │ │ │ │ :ref:`0 <sysfs_context>`/avail_operations,operations,addr_unit,telescope
+    │ │ │ │ :ref:`0 <sysfs_context>`/avail_operations,operations,addr_unit,telescope,max_ptes_per_sampling
     │ │ │ │ │ :ref:`monitoring_attrs <sysfs_monitoring_attrs>`/
     │ │ │ │ │ │ intervals/sample_us,aggr_us,update_us
     │ │ │ │ │ │ │ intervals_goal/access_bp,aggrs,min_sample_us,max_sample_us
@@ -188,9 +188,9 @@ details).  At the moment, only one context per kdamond is supported, so only
 contexts/<N>/
 -------------
 
-In each context directory, four files (``avail_operations``, ``operations``,
-``addr_unit``, and ``telescope``) and three directories (``monitoring_attrs``,
-``targets``, and ``schemes``) exist.
+In each context directory, five files (``avail_operations``, ``operations``,
+``addr_unit``, ``telescope``, and ``max_ptes_per_sampling``) and three
+directories (``monitoring_attrs``, ``targets``, and ``schemes``) exist.
 
 DAMON supports multiple types of :ref:`monitoring operations
 <damon_design_configurable_operations_set>`, including those for virtual address
@@ -217,11 +217,36 @@ next level down.  Write the file, then commit the inputs or start the
 kdamond, the same way as the other context parameters.  The file has no
 effect on physical-address monitoring.
 
+With Telescope on, the boundaries of every region of a virtual address space
+are aligned to the page table level the region is sampled at.  A region with
+both boundaries 1 GiB aligned is sampled at PUD level, one with both boundaries
+2 MiB aligned at PMD level, and any other region at the leaf level.  DAMON
+splits regions only at the boundaries of their level.  A region of one entry
+is split at the boundaries of the next level down, so a 1 GiB region becomes
+PMD level regions and a 2 MiB region becomes leaf level regions.  When regions
+are merged, a part of the merged region that is aligned to a higher level
+becomes a region of that level, and what is left on either end stays at the
+lower level.  The monitoring intervals auto-tuning counts a region with the
+number of entries of its level.
+
 Telescope also works on hugetlb mappings.  A hugetlb page that is as large as
 the sampled level (a 1 GiB page at the PUD level, a 2 MiB page at the PMD
 level) is sampled from its own entry.  A 2 MiB hugetlb page sampled at the PUD
 level reads the accessed bit of the PUD entry that points to its PMD table.
 Transparent hugepages are ordinary PMD entries and need no special handling.
+
+``max_ptes_per_sampling`` sets how many adjacent page table entries DAMON
+checks for a region in one sampling interval, for virtual address monitoring.
+The default is ``1``, which checks the one entry at the region's random
+sampling address.  A larger value checks the block of that many entries that
+is aligned to the block size and contains the sampling address, clipped to the
+region.  The entries are of the page table level selected by ``telescope``.
+The maximum is ``512``.  A value that is not a power of two, or is larger than
+the maximum, is rounded down to the closest power of two within the range.
+Each region counts the entries it checked in the aggregation interval
+(``nr_samples``), and the access frequency of the region is ``nr_accesses``
+divided by ``nr_samples``.  The file has no effect on physical-address
+monitoring.
 
 .. _sysfs_monitoring_attrs:
 

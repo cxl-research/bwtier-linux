@@ -102,6 +102,7 @@ TRACE_EVENT(damon_aggregated,
 		__field(unsigned long, start)
 		__field(unsigned long, end)
 		__field(unsigned int, nr_accesses)
+		__field(unsigned int, nr_samples)
 		__field(unsigned int, age)
 	),
 
@@ -111,13 +112,15 @@ TRACE_EVENT(damon_aggregated,
 		__entry->start = r->ar.start;
 		__entry->end = r->ar.end;
 		__entry->nr_accesses = r->nr_accesses;
+		__entry->nr_samples = r->nr_samples;
 		__entry->age = r->age;
 	),
 
-	TP_printk("target_id=%lu nr_regions=%u %lu-%lu: %u %u",
+	TP_printk("target_id=%lu nr_regions=%u %lu-%lu: %u %u %u",
 			__entry->target_id, __entry->nr_regions,
 			__entry->start, __entry->end,
-			__entry->nr_accesses, __entry->age)
+			__entry->nr_accesses, __entry->nr_samples,
+			__entry->age)
 );
 
 #endif /* _TRACE_DAMON_H */
