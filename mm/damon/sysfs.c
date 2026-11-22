@@ -5,9 +5,11 @@
  * Copyright (c) 2022 SeongJae Park <sj@kernel.org>
  */
 
+#include <linux/ctype.h>
 #include <linux/pid.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 
 #include "sysfs-common.h"
 
@@ -835,6 +837,7 @@ struct damon_sysfs_context {
 	struct kobject kobj;
 	enum damon_ops_id ops_id;
 	unsigned long addr_unit;
+	unsigned long min_region_size;
 	bool telescope;
 	unsigned int max_ptes_per_sampling;
 	unsigned int samplings_per_aggr;
@@ -857,6 +860,7 @@ static struct damon_sysfs_context *damon_sysfs_context_alloc(
 	context->kobj = (struct kobject){};
 	context->ops_id = ops_id;
 	context->addr_unit = 1;
+	context->min_region_size = PAGE_SIZE;
 	context->telescope = false;
 	context->max_ptes_per_sampling = 1;
 	context->samplings_per_aggr = DAMON_DEFAULT_SAMPLINGS_PER_AGGR;
@@ -1037,6 +1041,54 @@ static ssize_t addr_unit_store(struct kobject *kobj,
 	return count;
 }
 
+/*
+ * Parse the minimum region size, which is either the base page size or 2 MiB.
+ * The value can be in bytes, or have a K or M suffix, optionally followed by B.
+ */
+static int damon_sysfs_parse_min_region_size(const char *buf,
+		unsigned long *size)
+{
+	unsigned long val;
+	char *end;
+
+	if (!isdigit(*buf))
+		return -EINVAL;
+	val = memparse(buf, &end);
+	if (*end == 'B' || *end == 'b')
+		end++;
+	if (*end == '\n')
+		end++;
+	if (*end)
+		return -EINVAL;
+	if (val != PAGE_SIZE && val != SZ_2M)
+		return -EINVAL;
+	*size = val;
+	return 0;
+}
+
+static ssize_t min_region_size_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damon_sysfs_context *context = container_of(kobj,
+			struct damon_sysfs_context, kobj);
+
+	return sysfs_emit(buf, "%lu\n", context->min_region_size);
+}
+
+static ssize_t min_region_size_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct damon_sysfs_context *context = container_of(kobj,
+			struct damon_sysfs_context, kobj);
+	unsigned long size;
+	int err = damon_sysfs_parse_min_region_size(buf, &size);
+
+	if (err)
+		return err;
+	context->min_region_size = size;
+	return count;
+}
+
 static ssize_t telescope_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -1130,6 +1182,9 @@ static struct kobj_attribute damon_sysfs_context_operations_attr =
 static struct kobj_attribute damon_sysfs_context_addr_unit_attr =
 		__ATTR_RW_MODE(addr_unit, 0600);
 
+static struct kobj_attribute damon_sysfs_context_min_region_size_attr =
+		__ATTR_RW_MODE(min_region_size, 0600);
+
 static struct kobj_attribute damon_sysfs_context_telescope_attr =
 		__ATTR_RW_MODE(telescope, 0600);
 
@@ -1152,6 +1207,7 @@ static struct attribute *damon_sysfs_context_attrs[] = {
 	&damon_sysfs_context_avail_operations_attr.attr,
 	&damon_sysfs_context_operations_attr.attr,
 	&damon_sysfs_context_addr_unit_attr.attr,
+	&damon_sysfs_context_min_region_size_attr.attr,
 	&damon_sysfs_context_telescope_attr.attr,
 	&damon_sysfs_context_max_ptes_per_sampling_attr.attr,
 	&damon_sysfs_context_samplings_per_aggr_attr.attr,
@@ -1561,7 +1617,10 @@ static int damon_sysfs_apply_inputs(struct damon_ctx *ctx,
 	/* addr_unit is respected by only DAMON_OPS_PADDR */
 	if (sys_ctx->ops_id == DAMON_OPS_PADDR)
 		ctx->min_sz_region = max(
-				DAMON_MIN_REGION / sys_ctx->addr_unit, 1);
+				sys_ctx->min_region_size / sys_ctx->addr_unit,
+				1UL);
+	else
+		ctx->min_sz_region = sys_ctx->min_region_size;
 	err = damon_sysfs_set_attrs(ctx, sys_ctx->attrs);
 	if (err)
 		return err;

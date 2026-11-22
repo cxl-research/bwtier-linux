@@ -1647,6 +1647,17 @@ int damon_region_level(struct damon_ctx *ctx, struct damon_region *r)
 	return damon_range_level(r->ar.start, r->ar.end);
 }
 
+/*
+ * Size of a leaf entry, in the core address unit.  This is the base page size
+ * and not the minimum region size, which a user can make bigger.
+ */
+static unsigned long damon_leaf_unit(struct damon_ctx *ctx)
+{
+	if (ctx->ops.id == DAMON_OPS_PADDR)
+		return max(DAMON_MIN_REGION / ctx->addr_unit, 1UL);
+	return DAMON_MIN_REGION;
+}
+
 /* Size of the entries that a region is profiled with */
 static unsigned long damon_region_unit(struct damon_ctx *ctx,
 		struct damon_region *r)
@@ -1657,7 +1668,7 @@ static unsigned long damon_region_unit(struct damon_ctx *ctx,
 	case 1:
 		return PMD_SIZE;
 	default:
-		return ctx->min_sz_region;
+		return damon_leaf_unit(ctx);
 	}
 }
 

@@ -16,7 +16,10 @@
 #include <linux/types.h>
 #include <linux/random.h>
 
-/* Minimal region size.  Every damon_region is aligned by this. */
+/*
+ * Default minimal region size.  Every damon_region is aligned by the ctx's
+ * min_sz_region, which is this by default and configurable via sysfs.
+ */
 #define DAMON_MIN_REGION	PAGE_SIZE
 /* Max priority score for DAMON-based operation schemes */
 #define DAMOS_MAX_SCORE		(99)
