@@ -837,6 +837,10 @@ struct damon_sysfs_context {
 	unsigned long addr_unit;
 	bool telescope;
 	unsigned int max_ptes_per_sampling;
+	unsigned int samplings_per_aggr;
+	unsigned int max_aggr_samplings;
+	unsigned int afs_lo_pct;
+	unsigned int afs_hi_pct;
 	struct damon_sysfs_attrs *attrs;
 	struct damon_sysfs_targets *targets;
 	struct damon_sysfs_schemes *schemes;
@@ -855,6 +859,10 @@ static struct damon_sysfs_context *damon_sysfs_context_alloc(
 	context->addr_unit = 1;
 	context->telescope = false;
 	context->max_ptes_per_sampling = 1;
+	context->samplings_per_aggr = DAMON_DEFAULT_SAMPLINGS_PER_AGGR;
+	context->max_aggr_samplings = DAMON_DEFAULT_MAX_AGGR_SAMPLINGS;
+	context->afs_lo_pct = DAMON_DEFAULT_AFS_LO_PCT;
+	context->afs_hi_pct = DAMON_DEFAULT_AFS_HI_PCT;
 	return context;
 }
 
@@ -1075,6 +1083,39 @@ static ssize_t max_ptes_per_sampling_store(struct kobject *kobj,
 	return count;
 }
 
+/* Store an unsigned int in [@min, @max] to a field of the context */
+#define DAMON_SYSFS_CTX_UINT_ATTR(_name, _min, _max)			\
+static ssize_t _name##_show(struct kobject *kobj,			\
+		struct kobj_attribute *attr, char *buf)			\
+{									\
+	struct damon_sysfs_context *context = container_of(kobj,	\
+			struct damon_sysfs_context, kobj);		\
+									\
+	return sysfs_emit(buf, "%u\n", context->_name);			\
+}									\
+									\
+static ssize_t _name##_store(struct kobject *kobj,			\
+		struct kobj_attribute *attr, const char *buf,		\
+		size_t count)						\
+{									\
+	struct damon_sysfs_context *context = container_of(kobj,	\
+			struct damon_sysfs_context, kobj);		\
+	unsigned int val;						\
+	int err = kstrtouint(buf, 0, &val);				\
+									\
+	if (err)							\
+		return err;						\
+	if (val < (_min) || val > (_max))				\
+		return -EINVAL;						\
+	context->_name = val;						\
+	return count;							\
+}
+
+DAMON_SYSFS_CTX_UINT_ATTR(samplings_per_aggr, 1, DAMON_MAX_SAMPLINGS_PER_AGGR)
+DAMON_SYSFS_CTX_UINT_ATTR(max_aggr_samplings, 1, DAMON_MAX_SAMPLINGS_PER_AGGR)
+DAMON_SYSFS_CTX_UINT_ATTR(afs_lo_pct, 1, 99)
+DAMON_SYSFS_CTX_UINT_ATTR(afs_hi_pct, 1, 99)
+
 static void damon_sysfs_context_release(struct kobject *kobj)
 {
 	kfree(container_of(kobj, struct damon_sysfs_context, kobj));
@@ -1095,12 +1136,28 @@ static struct kobj_attribute damon_sysfs_context_telescope_attr =
 static struct kobj_attribute damon_sysfs_context_max_ptes_per_sampling_attr =
 		__ATTR_RW_MODE(max_ptes_per_sampling, 0600);
 
+static struct kobj_attribute damon_sysfs_context_samplings_per_aggr_attr =
+		__ATTR_RW_MODE(samplings_per_aggr, 0600);
+
+static struct kobj_attribute damon_sysfs_context_max_aggr_samplings_attr =
+		__ATTR_RW_MODE(max_aggr_samplings, 0600);
+
+static struct kobj_attribute damon_sysfs_context_afs_lo_pct_attr =
+		__ATTR_RW_MODE(afs_lo_pct, 0600);
+
+static struct kobj_attribute damon_sysfs_context_afs_hi_pct_attr =
+		__ATTR_RW_MODE(afs_hi_pct, 0600);
+
 static struct attribute *damon_sysfs_context_attrs[] = {
 	&damon_sysfs_context_avail_operations_attr.attr,
 	&damon_sysfs_context_operations_attr.attr,
 	&damon_sysfs_context_addr_unit_attr.attr,
 	&damon_sysfs_context_telescope_attr.attr,
 	&damon_sysfs_context_max_ptes_per_sampling_attr.attr,
+	&damon_sysfs_context_samplings_per_aggr_attr.attr,
+	&damon_sysfs_context_max_aggr_samplings_attr.attr,
+	&damon_sysfs_context_afs_lo_pct_attr.attr,
+	&damon_sysfs_context_afs_hi_pct_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(damon_sysfs_context);
@@ -1495,6 +1552,12 @@ static int damon_sysfs_apply_inputs(struct damon_ctx *ctx,
 	ctx->addr_unit = sys_ctx->addr_unit;
 	ctx->telescope = sys_ctx->telescope;
 	ctx->max_ptes_per_sampling = sys_ctx->max_ptes_per_sampling;
+	if (sys_ctx->afs_lo_pct >= sys_ctx->afs_hi_pct)
+		return -EINVAL;
+	ctx->samplings_per_aggr = sys_ctx->samplings_per_aggr;
+	ctx->max_aggr_samplings = sys_ctx->max_aggr_samplings;
+	ctx->afs_lo_pct = sys_ctx->afs_lo_pct;
+	ctx->afs_hi_pct = sys_ctx->afs_hi_pct;
 	/* addr_unit is respected by only DAMON_OPS_PADDR */
 	if (sys_ctx->ops_id == DAMON_OPS_PADDR)
 		ctx->min_sz_region = max(

@@ -131,10 +131,15 @@ struct damon_region *damon_new_region(unsigned long start, unsigned long end)
 	region->nr_accesses = 0;
 	region->nr_samples = 0;
 	region->nr_accesses_bp = 0;
+	region->samplings_per_aggr = 0;
 	INIT_LIST_HEAD(&region->list);
 
 	region->age = 0;
+	region->hotness = 0;
 	region->last_nr_accesses = 0;
+	region->samplings_done = 0;
+	region->next_sample_ns = U64_MAX;
+	region->sample_due = false;
 
 	return region;
 }
@@ -552,6 +557,10 @@ struct damon_ctx *damon_new_ctx(void)
 	ctx->addr_unit = 1;
 	ctx->min_sz_region = DAMON_MIN_REGION;
 	ctx->max_ptes_per_sampling = 1;
+	ctx->samplings_per_aggr = DAMON_DEFAULT_SAMPLINGS_PER_AGGR;
+	ctx->max_aggr_samplings = DAMON_DEFAULT_MAX_AGGR_SAMPLINGS;
+	ctx->afs_lo_pct = DAMON_DEFAULT_AFS_LO_PCT;
+	ctx->afs_hi_pct = DAMON_DEFAULT_AFS_HI_PCT;
 
 	INIT_LIST_HEAD(&ctx->adaptive_targets);
 	INIT_LIST_HEAD(&ctx->schemes);
@@ -1269,6 +1278,10 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 	dst->min_sz_region = src->min_sz_region;
 	dst->telescope = src->telescope;
 	dst->max_ptes_per_sampling = src->max_ptes_per_sampling;
+	dst->samplings_per_aggr = src->samplings_per_aggr;
+	dst->max_aggr_samplings = src->max_aggr_samplings;
+	dst->afs_lo_pct = src->afs_lo_pct;
+	dst->afs_hi_pct = src->afs_hi_pct;
 
 	return 0;
 }
@@ -1539,6 +1552,38 @@ static void damon_warn_fix_nr_accesses_corruption(struct damon_region *r,
 	r->nr_accesses_bp = nr_accesses * 10000;
 }
 
+/* The samplings per aggregation interval of @r, with the default resolved */
+static unsigned int damon_region_samplings(struct damon_ctx *ctx,
+		struct damon_region *r)
+{
+	if (r->samplings_per_aggr)
+		return r->samplings_per_aggr;
+	return clamp(ctx->samplings_per_aggr, 1u,
+			DAMON_MAX_SAMPLINGS_PER_AGGR);
+}
+
+/*
+ * Adapt the sampling frequency of a region to what the last aggregation
+ * interval found.  A region found accessed in most samplings is sampled more
+ * often in the next interval, so that its accesses do not saturate, and one
+ * found accessed in few samplings is sampled less often.
+ */
+static void damon_adapt_samplings(struct damon_ctx *ctx,
+		struct damon_region *r)
+{
+	unsigned int spa = damon_region_samplings(ctx, r);
+
+	if (r->nr_samples) {
+		if ((u64)r->nr_accesses * 100 >
+				(u64)ctx->afs_hi_pct * r->nr_samples)
+			spa = min(spa * 2, DAMON_MAX_SAMPLINGS_PER_AGGR);
+		else if ((u64)r->nr_accesses * 100 <
+				(u64)ctx->afs_lo_pct * r->nr_samples)
+			spa = max(spa / 2, 1u);
+	}
+	r->samplings_per_aggr = spa;
+}
+
 /*
  * Reset the aggregated monitoring results ('nr_accesses' of each region).
  */
@@ -1555,6 +1600,8 @@ static void kdamond_reset_aggregated(struct damon_ctx *c)
 			damon_warn_fix_nr_accesses_corruption(r, &c->attrs);
 			r->last_nr_accesses =
 				damon_region_nr_accesses(r, &c->attrs);
+			r->hotness = damon_region_hotness(c, r);
+			damon_adapt_samplings(c, r);
 			r->nr_accesses = 0;
 			r->nr_samples = 0;
 		}
@@ -1612,6 +1659,27 @@ static unsigned long damon_region_unit(struct damon_ctx *ctx,
 	default:
 		return ctx->min_sz_region;
 	}
+}
+
+/**
+ * damon_region_hotness() - Hotness score of a region.
+ * @ctx:	The context of the region.
+ * @r:		The region.
+ *
+ * Return: the number of the entries of the page table level that @r is
+ * profiled at, times @r->nr_accesses / @r->nr_samples, times the samplings per
+ * aggregation interval of @r.  Zero if @r was not sampled.
+ */
+unsigned long damon_region_hotness(struct damon_ctx *ctx,
+		struct damon_region *r)
+{
+	u64 nr_units;
+
+	if (!r->nr_samples)
+		return 0;
+	nr_units = max(1UL, damon_sz_region(r) / damon_region_unit(ctx, r));
+	return div64_u64(nr_units * r->nr_accesses *
+			damon_region_samplings(ctx, r), r->nr_samples);
 }
 
 /*
@@ -2430,6 +2498,8 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
 /*
  * Merge two adjacent regions into one region
  */
+#define DAMON_MERGE_THRES_PCT	10
+
 static void damon_merge_two_regions(struct damon_target *t,
 		struct damon_attrs *attrs, struct damon_region *l,
 		struct damon_region *r)
@@ -2440,6 +2510,10 @@ static void damon_merge_two_regions(struct damon_target *t,
 			(sz_l + sz_r);
 	l->nr_samples = (l->nr_samples * sz_l + r->nr_samples * sz_r) /
 			(sz_l + sz_r);
+	l->samplings_per_aggr = max(1UL,
+			((unsigned long)l->samplings_per_aggr * sz_l +
+			 (unsigned long)r->samplings_per_aggr * sz_r) /
+			(sz_l + sz_r));
 	l->nr_accesses_bp = damon_region_nr_accesses(l, attrs) * 10000;
 	l->age = (l->age * sz_l + r->age * sz_r) / (sz_l + sz_r);
 	l->ar.end = r->ar.end;
@@ -2447,24 +2521,62 @@ static void damon_merge_two_regions(struct damon_target *t,
 }
 
 /*
+ * Estimated number of accesses of a region in one aggregation interval,
+ * multiplied by 100: its access ratio times its samplings per aggregation
+ * interval.  Without samples it is just @nr_accesses.
+ */
+static u64 damon_region_est_accesses_x100(struct damon_ctx *ctx,
+		struct damon_region *r)
+{
+	if (!r->nr_samples)
+		return (u64)r->nr_accesses * 100;
+	return div_u64((u64)r->nr_accesses * damon_region_samplings(ctx, r) *
+			100, r->nr_samples);
+}
+
+/*
+ * Whether the access frequencies of two adjacent regions are similar.  Regions
+ * sampled with frequencies that differ by 2x or more are not.  Otherwise the
+ * regions are similar if their estimated accesses per aggregation interval
+ * differ by at most @pct percent of the larger samplings per aggregation
+ * interval of the two.
+ */
+static bool damon_regions_similar(struct damon_ctx *ctx,
+		struct damon_region *l, struct damon_region *r,
+		unsigned int pct)
+{
+	unsigned int sl = damon_region_samplings(ctx, l);
+	unsigned int sr = damon_region_samplings(ctx, r);
+	u64 el, er;
+
+	if (max(sl, sr) >= 2 * min(sl, sr))
+		return false;
+	el = damon_region_est_accesses_x100(ctx, l);
+	er = damon_region_est_accesses_x100(ctx, r);
+	return (el > er ? el - er : er - el) <= (u64)max(sl, sr) * pct;
+}
+
+/*
  * Merge adjacent regions having similar access frequencies
  *
  * ctx		context of the target
  * t		target affected by this merge operation
- * thres	'->nr_accesses' diff threshold for the merge
+ * pct		merge threshold, in percent of the samplings per aggregation
+ *		interval (see damon_regions_similar())
  * sz_limit	size upper limit of each region
  */
 static void damon_merge_regions_of(struct damon_ctx *ctx,
-		struct damon_target *t, unsigned int thres,
+		struct damon_target *t, unsigned int pct,
 		unsigned long sz_limit)
 {
 	struct damon_attrs *attrs = &ctx->attrs;
+	unsigned int age_thres = damon_max_nr_accesses(attrs) / 10;
 	struct damon_region *r, *prev = NULL, *next;
 
 	damon_for_each_region_safe(r, next, t) {
 		unsigned int nr_accesses = damon_region_nr_accesses(r, attrs);
 
-		if (abs(nr_accesses - r->last_nr_accesses) > thres)
+		if (abs(nr_accesses - r->last_nr_accesses) > age_thres)
 			r->age = 0;
 		else if ((nr_accesses == 0) != (r->last_nr_accesses == 0))
 			r->age = 0;
@@ -2472,8 +2584,7 @@ static void damon_merge_regions_of(struct damon_ctx *ctx,
 			r->age++;
 
 		if (prev && prev->ar.end == r->ar.start &&
-		    abs(damon_region_nr_accesses(prev, attrs) - nr_accesses) <=
-		    thres &&
+		    damon_regions_similar(ctx, prev, r, pct) &&
 		    damon_sz_region(prev) + damon_sz_region(r) <= sz_limit &&
 		    damon_merge_is_useful(ctx, prev, r)) {
 			damon_merge_two_regions(t, attrs, prev, r);
@@ -2487,11 +2598,12 @@ static void damon_merge_regions_of(struct damon_ctx *ctx,
 /*
  * Merge adjacent regions having similar access frequencies
  *
- * threshold	'->nr_accesses' diff threshold for the merge
  * sz_limit	size upper limit of each region
  *
  * This function merges monitoring target regions which are adjacent and their
- * access frequencies are similar.  This is for minimizing the monitoring
+ * access frequencies are similar.  There is no global threshold: two regions
+ * are compared with the sampling frequencies they have, see
+ * damon_regions_similar().  The merge is for minimizing the monitoring
  * overhead under the dynamically changeable access pattern.  If a merge was
  * unnecessarily made, later 'kdamond_split_regions()' will revert it.
  *
@@ -2499,26 +2611,22 @@ static void damon_merge_regions_of(struct damon_ctx *ctx,
  * max_nr_regions for some cases.  For example, the user can update
  * max_nr_regions to a number that lower than the current number of regions
  * while DAMON is running.  For such a case, repeat merging until the limit is
- * met while increasing @threshold up to possible maximum level.
+ * met while doubling the percentage, up to the 100% of the samplings.
  */
-static void kdamond_merge_regions(struct damon_ctx *c, unsigned int threshold,
-				  unsigned long sz_limit)
+static void kdamond_merge_regions(struct damon_ctx *c, unsigned long sz_limit)
 {
 	struct damon_target *t;
 	unsigned int nr_regions;
-	unsigned int max_thres;
+	unsigned int pct = DAMON_MERGE_THRES_PCT;
 
-	max_thres = c->attrs.aggr_interval /
-		(c->attrs.sample_interval ?  c->attrs.sample_interval : 1);
 	do {
 		nr_regions = 0;
 		damon_for_each_target(t, c) {
-			damon_merge_regions_of(c, t, threshold, sz_limit);
+			damon_merge_regions_of(c, t, pct, sz_limit);
 			nr_regions += damon_nr_regions(t);
 		}
-		threshold = max(1, threshold * 2);
-	} while (nr_regions > c->attrs.max_nr_regions &&
-			threshold / 2 < max_thres);
+		pct *= 2;
+	} while (nr_regions > c->attrs.max_nr_regions && pct / 2 < 100);
 }
 
 /*
@@ -2543,6 +2651,7 @@ static void damon_split_region_at(struct damon_target *t,
 	new->nr_accesses_bp = r->nr_accesses_bp;
 	new->nr_accesses = r->nr_accesses;
 	new->nr_samples = r->nr_samples;
+	new->samplings_per_aggr = r->samplings_per_aggr;
 
 	damon_insert_region(new, r, damon_next_region(r), t);
 }
@@ -2710,6 +2819,9 @@ static unsigned long damos_wmark_wait_us(struct damos *scheme)
 	return 0;
 }
 
+/* Slack of the sleeps until the next sampling, in microseconds */
+#define KDAMOND_SLEEP_SLACK_US	20
+
 static void kdamond_usleep(unsigned long usecs)
 {
 	if (usecs >= USLEEP_RANGE_UPPER_BOUND)
@@ -2818,6 +2930,148 @@ static void kdamond_init_ctx(struct damon_ctx *ctx)
 }
 
 /*
+ * Sleep until @target_ns on the ktime_get_ns() clock.  Return at once if it is
+ * already passed.
+ */
+static void kdamond_sleep_until(u64 target_ns)
+{
+	u64 now = ktime_get_ns();
+	unsigned long usecs;
+
+	if (target_ns <= now)
+		return;
+	usecs = DIV_ROUND_UP(target_ns - now, NSEC_PER_USEC);
+	usleep_range_idle(usecs, usecs + KDAMOND_SLEEP_SLACK_US);
+}
+
+/* Sampling period of a region, in nanoseconds */
+static u64 damon_region_sampling_period_ns(struct damon_ctx *ctx,
+		struct damon_region *r, u64 aggr_ns)
+{
+	return max(1ULL, div_u64(aggr_ns, damon_region_samplings(ctx, r)));
+}
+
+/*
+ * Make every region ready for a new aggregation interval that starts at
+ * @start_ns: resolve the sampling frequency of the region, and schedule the
+ * first check one sampling period from now.  All regions are marked due, for
+ * the first access check preparation.
+ */
+static void kdamond_arm_regions(struct damon_ctx *ctx, u64 start_ns,
+		u64 aggr_ns)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t) {
+			r->samplings_per_aggr = damon_region_samplings(ctx, r);
+			r->samplings_done = 0;
+			r->next_sample_ns = start_ns +
+				damon_region_sampling_period_ns(ctx, r,
+						aggr_ns);
+			r->sample_due = true;
+		}
+	}
+}
+
+static void kdamond_clear_due(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+
+	damon_for_each_target(t, ctx)
+		damon_for_each_region(r, t)
+			r->sample_due = false;
+}
+
+/* Mark the regions whose sampling time has come as due.  Return if any. */
+static bool kdamond_mark_due(struct damon_ctx *ctx, u64 now_ns)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	bool any = false;
+
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t) {
+			r->sample_due = r->next_sample_ns <= now_ns;
+			any |= r->sample_due;
+		}
+	}
+	return any;
+}
+
+/*
+ * The regions that were checked have one sampling more done.  If one has
+ * samplings left, and the next one is not later than the end of the
+ * aggregation interval, schedule it and keep the region due, for the
+ * preparation of the next check.  Otherwise the region is done until the next
+ * aggregation interval.
+ */
+static void kdamond_reschedule_due(struct damon_ctx *ctx, u64 aggr_ns,
+		u64 end_ns)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned int max_samplings = max(1u, ctx->max_aggr_samplings);
+
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t) {
+			if (!r->sample_due)
+				continue;
+			r->samplings_done++;
+			r->next_sample_ns +=
+				damon_region_sampling_period_ns(ctx, r,
+						aggr_ns);
+			if (r->samplings_done >= max_samplings ||
+					r->samplings_done >=
+					r->samplings_per_aggr ||
+					r->next_sample_ns > end_ns) {
+				r->next_sample_ns = U64_MAX;
+				r->sample_due = false;
+			}
+		}
+	}
+}
+
+/* Time of the earliest sampling of the regions, or @end_ns if later */
+static u64 kdamond_next_sample_ns(struct damon_ctx *ctx, u64 end_ns)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	u64 next = end_ns;
+
+	damon_for_each_target(t, ctx)
+		damon_for_each_region(r, t)
+			next = min(next, r->next_sample_ns);
+	return next;
+}
+
+static void damon_time_stat_add(struct damon_time_stat *stat, u64 ns)
+{
+	if (!stat->nr || ns < stat->min)
+		stat->min = ns;
+	stat->max = max(stat->max, ns);
+	stat->sum += ns;
+	stat->nr++;
+}
+
+/*
+ * Set the access frequency estimates that the schemes and the sysfs interface
+ * read, for the aggregation interval that ends now.
+ */
+static void kdamond_finish_aggregation(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+
+	damon_for_each_target(t, ctx)
+		damon_for_each_region(r, t)
+			r->nr_accesses_bp = damon_region_nr_accesses(r,
+					&ctx->attrs) * 10000;
+}
+
+/*
  * The monitoring daemon that runs as a kernel thread
  */
 static int kdamond_fn(void *data)
@@ -2825,7 +3079,6 @@ static int kdamond_fn(void *data)
 	struct damon_ctx *ctx = data;
 	struct damon_target *t;
 	struct damon_region *r, *next;
-	unsigned int max_nr_accesses = 0;
 	unsigned long sz_limit = 0;
 
 	pr_debug("kdamond (%d) starts\n", current->pid);
@@ -2842,6 +3095,10 @@ static int kdamond_fn(void *data)
 
 	sz_limit = damon_region_sz_limit(ctx);
 
+	/*
+	 * One iteration of this loop is one aggregation interval.  The regions
+	 * are sampled at their own frequencies inside it.
+	 */
 	while (!kdamond_need_stop(ctx)) {
 		/*
 		 * ctx->attrs and ctx->next_{aggregation,ops_update}_sis could
@@ -2851,7 +3108,9 @@ static int kdamond_fn(void *data)
 		 */
 		unsigned long next_aggregation_sis = ctx->next_aggregation_sis;
 		unsigned long next_ops_update_sis = ctx->next_ops_update_sis;
-		unsigned long sample_interval = ctx->attrs.sample_interval;
+		unsigned long sample_interval;
+		struct damon_timekeeping tk = {};
+		u64 aggr_ns, start_ns, end_ns, now_ns, prepared_ns, t0;
 
 		if (kdamond_wait_activation(ctx))
 			break;
@@ -2859,19 +3118,51 @@ static int kdamond_fn(void *data)
 		/* Regions set by anyone but the merge and split are cut here */
 		kdamond_normalize_regions(ctx);
 
+		aggr_ns = (u64)ctx->attrs.aggr_interval * NSEC_PER_USEC;
+		start_ns = ktime_get_ns();
+		end_ns = start_ns + aggr_ns;
+		kdamond_arm_regions(ctx, start_ns, aggr_ns);
+
+		/* The first access check preparation of every region */
 		if (ctx->ops.prepare_access_checks)
 			ctx->ops.prepare_access_checks(ctx);
+		kdamond_clear_due(ctx);
+		now_ns = ktime_get_ns();
+		damon_time_stat_add(&tk.prepare, now_ns - start_ns);
+		damon_time_stat_add(&tk.loop, now_ns - start_ns);
 
-		kdamond_usleep(sample_interval);
-		ctx->passed_sample_intervals++;
+		/* Sampling loops, until the end of the aggregation interval */
+		while (true) {
+			kdamond_sleep_until(kdamond_next_sample_ns(ctx,
+						end_ns));
+			if (kdamond_need_stop(ctx))
+				goto done;
 
-		if (ctx->ops.check_accesses)
-			max_nr_accesses = ctx->ops.check_accesses(ctx);
+			t0 = ktime_get_ns();
+			/* Woken early, e.g., by a signal */
+			if (!kdamond_mark_due(ctx, t0) && t0 < end_ns)
+				continue;
+			if (ctx->ops.check_accesses)
+				ctx->ops.check_accesses(ctx);
+			now_ns = ktime_get_ns();
+			if (t0 >= end_ns)
+				break;
+			damon_time_stat_add(&tk.check, now_ns - t0);
 
-		if (ctx->passed_sample_intervals >= next_aggregation_sis)
-			kdamond_merge_regions(ctx,
-					max_nr_accesses / 10,
-					sz_limit);
+			kdamond_reschedule_due(ctx, aggr_ns, end_ns);
+			if (ctx->ops.prepare_access_checks)
+				ctx->ops.prepare_access_checks(ctx);
+			kdamond_clear_due(ctx);
+			prepared_ns = ktime_get_ns();
+			damon_time_stat_add(&tk.prepare, prepared_ns - now_ns);
+			damon_time_stat_add(&tk.loop, prepared_ns - t0);
+		}
+		kdamond_clear_due(ctx);
+
+		/* The aggregation round; it started at t0 */
+		ctx->passed_sample_intervals = next_aggregation_sis;
+		kdamond_finish_aggregation(ctx);
+		kdamond_merge_regions(ctx, sz_limit);
 
 		/*
 		 * do kdamond_call() and kdamond_apply_schemes() after
@@ -2885,42 +3176,36 @@ static int kdamond_fn(void *data)
 
 		sample_interval = ctx->attrs.sample_interval ?
 			ctx->attrs.sample_interval : 1;
-		if (ctx->passed_sample_intervals >= next_aggregation_sis) {
-			if (ctx->attrs.intervals_goal.aggrs &&
-					ctx->passed_sample_intervals >=
-					ctx->next_intervals_tune_sis) {
-				/*
-				 * ctx->next_aggregation_sis might be updated
-				 * from kdamond_call().  In the case,
-				 * damon_set_attrs() which will be called from
-				 * kdamond_tune_interval() may wrongly think
-				 * this is in the middle of the current
-				 * aggregation, and make aggregation
-				 * information reset for all regions.  Then,
-				 * following kdamond_reset_aggregated() call
-				 * will make the region information invalid,
-				 * particularly for ->nr_accesses_bp.
-				 *
-				 * Reset ->next_aggregation_sis to avoid that.
-				 * It will anyway correctly updated after this
-				 * if caluse.
-				 */
-				ctx->next_aggregation_sis =
-					next_aggregation_sis;
-				ctx->next_intervals_tune_sis +=
-					ctx->attrs.aggr_samples *
-					ctx->attrs.intervals_goal.aggrs;
-				kdamond_tune_intervals(ctx);
-				sample_interval = ctx->attrs.sample_interval ?
-					ctx->attrs.sample_interval : 1;
-
-			}
-			ctx->next_aggregation_sis = next_aggregation_sis +
-				ctx->attrs.aggr_interval / sample_interval;
-
-			kdamond_reset_aggregated(ctx);
-			kdamond_split_regions(ctx);
+		if (ctx->attrs.intervals_goal.aggrs &&
+				ctx->passed_sample_intervals >=
+				ctx->next_intervals_tune_sis) {
+			/*
+			 * ctx->next_aggregation_sis might be updated from
+			 * kdamond_call().  In the case, damon_set_attrs()
+			 * which will be called from kdamond_tune_interval()
+			 * may wrongly think this is in the middle of the
+			 * current aggregation, and make aggregation
+			 * information reset for all regions.  Then, following
+			 * kdamond_reset_aggregated() call will make the region
+			 * information invalid, particularly for
+			 * ->nr_accesses_bp.
+			 *
+			 * Reset ->next_aggregation_sis to avoid that.  It will
+			 * anyway correctly updated after this if caluse.
+			 */
+			ctx->next_aggregation_sis = next_aggregation_sis;
+			ctx->next_intervals_tune_sis +=
+				ctx->attrs.aggr_samples *
+				ctx->attrs.intervals_goal.aggrs;
+			kdamond_tune_intervals(ctx);
+			sample_interval = ctx->attrs.sample_interval ?
+				ctx->attrs.sample_interval : 1;
 		}
+		ctx->next_aggregation_sis = next_aggregation_sis +
+			ctx->attrs.aggr_interval / sample_interval;
+
+		kdamond_reset_aggregated(ctx);
+		kdamond_split_regions(ctx);
 
 		if (ctx->passed_sample_intervals >= next_ops_update_sis) {
 			ctx->next_ops_update_sis = next_ops_update_sis +
@@ -2930,6 +3215,9 @@ static int kdamond_fn(void *data)
 				ctx->ops.update(ctx);
 			sz_limit = damon_region_sz_limit(ctx);
 		}
+
+		tk.aggr_ns = ktime_get_ns() - t0;
+		trace_damon_timekeeping(&tk);
 	}
 done:
 	damon_for_each_target(t, ctx) {

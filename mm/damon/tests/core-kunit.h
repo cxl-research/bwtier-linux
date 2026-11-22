@@ -196,10 +196,12 @@ static void damon_test_merge_two_samples(struct kunit *test)
 	r = damon_new_region(0, 100);
 	r->nr_accesses = 50;
 	r->nr_samples = 200;
+	r->samplings_per_aggr = 16;
 	damon_add_region(r, t);
 	r2 = damon_new_region(100, 300);
 	r2->nr_accesses = 400;
 	r2->nr_samples = 800;
+	r2->samplings_per_aggr = 32;
 	damon_add_region(r2, t);
 
 	/* 25% and 50%, in nr_accesses units of the max (100) */
@@ -210,8 +212,200 @@ static void damon_test_merge_two_samples(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, r->nr_accesses, 283u);
 	KUNIT_EXPECT_EQ(test, r->nr_samples, 600u);
 	KUNIT_EXPECT_EQ(test, r->nr_accesses_bp, 47u * 10000);
+	/* size weighted: (16 * 100 + 32 * 200) / 300 */
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr, 26u);
 
 	damon_free_target(t);
+}
+
+static void damon_test_adapt_samplings(struct kunit *test)
+{
+	struct damon_ctx *c = damon_new_ctx();
+	struct damon_region *r = damon_new_region(0, 4096 * 10);
+
+	/* defaults: lo 25%, hi 75% */
+	r->nr_samples = 100;
+
+	r->samplings_per_aggr = 16;
+	r->nr_accesses = 90;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr, 32u);
+
+	r->nr_accesses = 10;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr, 16u);
+
+	/* 25% and 75% are in the band */
+	r->nr_accesses = 25;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr, 16u);
+	r->nr_accesses = 75;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr, 16u);
+
+	/* the bounds */
+	r->samplings_per_aggr = 1;
+	r->nr_accesses = 0;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr, 1u);
+	r->samplings_per_aggr = DAMON_MAX_SAMPLINGS_PER_AGGR;
+	r->nr_accesses = 100;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr,
+			DAMON_MAX_SAMPLINGS_PER_AGGR);
+
+	/* not sampled: unchanged; unset: the context's default */
+	r->samplings_per_aggr = 0;
+	r->nr_samples = 0;
+	r->nr_accesses = 0;
+	damon_adapt_samplings(c, r);
+	KUNIT_EXPECT_EQ(test, r->samplings_per_aggr,
+			(unsigned int)DAMON_DEFAULT_SAMPLINGS_PER_AGGR);
+
+	damon_free_region(r);
+	damon_destroy_ctx(c);
+}
+
+static void damon_test_regions_similar(struct kunit *test)
+{
+	struct damon_ctx *c = damon_new_ctx();
+	struct damon_region *l = damon_new_region(0, 4096);
+	struct damon_region *r = damon_new_region(4096, 8192);
+
+	l->samplings_per_aggr = 16;
+	l->nr_samples = 16;
+	l->nr_accesses = 8;
+	r->samplings_per_aggr = 16;
+	r->nr_samples = 16;
+	r->nr_accesses = 9;
+
+	/* 8 and 9 accesses differ by 1, 10% of 16 is 1.6 */
+	KUNIT_EXPECT_TRUE(test, damon_regions_similar(c, l, r, 10));
+	r->nr_accesses = 10;
+	KUNIT_EXPECT_FALSE(test, damon_regions_similar(c, l, r, 10));
+	KUNIT_EXPECT_TRUE(test, damon_regions_similar(c, l, r, 20));
+
+	/*
+	 * 24 is less than 2x of 16: 8 of 16 and 10 of 24 estimate 8 and 10
+	 * accesses per aggregation interval, 10% of 24 is 2.4.  The same ratio
+	 * on different sampling frequencies is not the same access frequency.
+	 */
+	r->samplings_per_aggr = 24;
+	r->nr_samples = 24;
+	r->nr_accesses = 10;
+	KUNIT_EXPECT_TRUE(test, damon_regions_similar(c, l, r, 10));
+	r->nr_accesses = 11;
+	KUNIT_EXPECT_FALSE(test, damon_regions_similar(c, l, r, 10));
+	r->nr_accesses = 12;
+	KUNIT_EXPECT_FALSE(test, damon_regions_similar(c, l, r, 10));
+
+	/* 2x apart: never similar, even with equal estimated accesses */
+	r->samplings_per_aggr = 32;
+	r->nr_samples = 32;
+	r->nr_accesses = 16;
+	KUNIT_EXPECT_FALSE(test, damon_regions_similar(c, l, r, 100));
+
+	/* the estimate uses the samplings per aggregation, not nr_samples */
+	r->samplings_per_aggr = 16;
+	r->nr_samples = 8;	/* max_aggr_samplings reached early */
+	r->nr_accesses = 4;
+	KUNIT_EXPECT_TRUE(test, damon_regions_similar(c, l, r, 10));
+
+	damon_free_region(l);
+	damon_free_region(r);
+	damon_destroy_ctx(c);
+}
+
+static void damon_test_region_hotness(struct kunit *test)
+{
+	struct damon_ctx *c = damon_new_ctx();
+	struct damon_region *r = damon_new_region(0, 10 * c->min_sz_region);
+
+	/* telescope is off: ten entries of the base page size */
+	r->nr_accesses = 50;
+	r->nr_samples = 100;
+	r->samplings_per_aggr = 64;
+	KUNIT_EXPECT_EQ(test, damon_region_hotness(c, r), 10ul * 50 * 64 / 100);
+
+	r->nr_samples = 0;
+	KUNIT_EXPECT_EQ(test, damon_region_hotness(c, r), 0ul);
+
+	damon_free_region(r);
+	damon_destroy_ctx(c);
+}
+
+static void damon_test_sampling_schedule(struct kunit *test)
+{
+	struct damon_ctx *c = damon_new_ctx();
+	struct damon_target *t = damon_new_target();
+	struct damon_region *r1 = damon_new_region(0, 4096);
+	struct damon_region *r2 = damon_new_region(4096, 8192);
+	u64 aggr_ns = 100 * NSEC_PER_MSEC, start = 1000, end = start + aggr_ns;
+	unsigned int i;
+
+	c->max_aggr_samplings = 3;
+	r1->samplings_per_aggr = 2;
+	r2->samplings_per_aggr = 8;
+	damon_add_region(r1, t);
+	damon_add_region(r2, t);
+	damon_add_target(c, t);
+
+	kdamond_arm_regions(c, start, aggr_ns);
+	KUNIT_EXPECT_TRUE(test, r1->sample_due && r2->sample_due);
+	KUNIT_EXPECT_EQ(test, r1->next_sample_ns, start + 50 * NSEC_PER_MSEC);
+	KUNIT_EXPECT_EQ(test, r2->next_sample_ns,
+			start + 100 * NSEC_PER_MSEC / 8);
+	KUNIT_EXPECT_EQ(test, kdamond_next_sample_ns(c, end),
+			r2->next_sample_ns);
+
+	kdamond_clear_due(c);
+	KUNIT_EXPECT_FALSE(test, r1->sample_due || r2->sample_due);
+	KUNIT_EXPECT_FALSE(test, kdamond_mark_due(c, start));
+
+	/* r2 first: due at 12.5 ms, and again at 25 ms */
+	KUNIT_EXPECT_TRUE(test, kdamond_mark_due(c, r2->next_sample_ns));
+	KUNIT_EXPECT_FALSE(test, r1->sample_due);
+	KUNIT_EXPECT_TRUE(test, r2->sample_due);
+	kdamond_reschedule_due(c, aggr_ns, end);
+	KUNIT_EXPECT_EQ(test, r2->samplings_done, 1u);
+	KUNIT_EXPECT_EQ(test, r2->next_sample_ns,
+			start + 2 * 100 * NSEC_PER_MSEC / 8);
+	KUNIT_EXPECT_TRUE(test, r2->sample_due);
+
+	/* r2 is limited to max_aggr_samplings, r1 to its two samplings */
+	for (i = 1; i < 3; i++) {
+		kdamond_mark_due(c, r2->next_sample_ns);
+		kdamond_reschedule_due(c, aggr_ns, end);
+	}
+	KUNIT_EXPECT_EQ(test, r2->samplings_done, 3u);
+	KUNIT_EXPECT_EQ(test, r2->next_sample_ns, U64_MAX);
+	KUNIT_EXPECT_EQ(test, kdamond_next_sample_ns(c, end), r1->next_sample_ns);
+
+	kdamond_mark_due(c, end);
+	KUNIT_EXPECT_TRUE(test, r1->sample_due);
+	KUNIT_EXPECT_FALSE(test, r2->sample_due);
+	kdamond_reschedule_due(c, aggr_ns, end);
+	KUNIT_EXPECT_EQ(test, r1->samplings_done, 1u);
+	KUNIT_EXPECT_EQ(test, r1->next_sample_ns, end);
+	kdamond_mark_due(c, end);
+	kdamond_reschedule_due(c, aggr_ns, end);
+	KUNIT_EXPECT_EQ(test, r1->next_sample_ns, U64_MAX);
+	KUNIT_EXPECT_EQ(test, kdamond_next_sample_ns(c, end), end);
+
+	damon_destroy_ctx(c);
+}
+
+static void damon_test_time_stat(struct kunit *test)
+{
+	struct damon_time_stat stat = {};
+
+	damon_time_stat_add(&stat, 30);
+	damon_time_stat_add(&stat, 10);
+	damon_time_stat_add(&stat, 20);
+	KUNIT_EXPECT_EQ(test, stat.nr, 3u);
+	KUNIT_EXPECT_EQ(test, stat.sum, 60ull);
+	KUNIT_EXPECT_EQ(test, stat.min, 10ull);
+	KUNIT_EXPECT_EQ(test, stat.max, 30ull);
 }
 
 static struct damon_region *__nth_region_of(struct damon_target *t, int idx)
@@ -248,7 +442,7 @@ static void damon_test_merge_regions_of(struct kunit *test)
 		damon_add_region(r, t);
 	}
 
-	damon_merge_regions_of(c, t, 9, 9999);
+	damon_merge_regions_of(c, t, DAMON_MERGE_THRES_PCT, 9999);
 	/* 0-112, 114-130, 130-156, 156-170 */
 	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), 5u);
 	for (i = 0; i < 5; i++) {
@@ -694,6 +888,11 @@ static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_split_at),
 	KUNIT_CASE(damon_test_merge_two),
 	KUNIT_CASE(damon_test_merge_two_samples),
+	KUNIT_CASE(damon_test_adapt_samplings),
+	KUNIT_CASE(damon_test_regions_similar),
+	KUNIT_CASE(damon_test_region_hotness),
+	KUNIT_CASE(damon_test_sampling_schedule),
+	KUNIT_CASE(damon_test_time_stat),
 	KUNIT_CASE(damon_test_merge_regions_of),
 	KUNIT_CASE(damon_test_split_regions_of),
 	KUNIT_CASE(damon_test_telescope_pieces),

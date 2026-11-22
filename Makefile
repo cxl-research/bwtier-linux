@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 18
 SUBLEVEL = 0
-EXTRAVERSION = -scan-not-sample
+EXTRAVERSION = -afs
 NAME = Baby Opossum Posse
 
 # *DOCUMENTATION*
