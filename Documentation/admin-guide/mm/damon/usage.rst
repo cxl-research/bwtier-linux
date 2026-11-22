@@ -61,7 +61,7 @@ comma (",").
     │ :ref:`kdamonds <sysfs_kdamonds>`/nr_kdamonds
     │ │ :ref:`0 <sysfs_kdamond>`/state,pid,refresh_ms
     │ │ │ :ref:`contexts <sysfs_contexts>`/nr_contexts
-    │ │ │ │ :ref:`0 <sysfs_context>`/avail_operations,operations,addr_unit,telescope,max_ptes_per_sampling,samplings_per_aggr,max_aggr_samplings,afs_lo_pct,afs_hi_pct
+    │ │ │ │ :ref:`0 <sysfs_context>`/avail_operations,operations,addr_unit,min_region_size,telescope,max_ptes_per_sampling,samplings_per_aggr,max_aggr_samplings,afs_lo_pct,afs_hi_pct
     │ │ │ │ │ :ref:`monitoring_attrs <sysfs_monitoring_attrs>`/
     │ │ │ │ │ │ intervals/sample_us,aggr_us,update_us
     │ │ │ │ │ │ │ intervals_goal/access_bp,aggrs,min_sample_us,max_sample_us
@@ -188,8 +188,8 @@ details).  At the moment, only one context per kdamond is supported, so only
 contexts/<N>/
 -------------
 
-In each context directory, nine files (``avail_operations``, ``operations``,
-``addr_unit``, ``telescope``, ``max_ptes_per_sampling``,
+In each context directory, ten files (``avail_operations``, ``operations``,
+``addr_unit``, ``min_region_size``, ``telescope``, ``max_ptes_per_sampling``,
 ``samplings_per_aggr``, ``max_aggr_samplings``, ``afs_lo_pct``, and
 ``afs_hi_pct``) and three directories (``monitoring_attrs``, ``targets``, and ``schemes``) exist.
 
@@ -208,6 +208,17 @@ reading from the ``operations`` file.
 
 ``addr_unit`` file is for setting and getting the :ref:`address unit
 <damon_design_addr_unit>` parameter of the operations set.
+
+``min_region_size`` file is for setting and getting the minimum size of the
+monitoring regions, in bytes.  Every region is aligned to, and is a multiple of,
+this size.  It can be only the base page size (4 KiB on most systems, which is
+the default) or 2 MiB.  The value can be written in bytes (``4096`` or
+``2097152``) or with the ``K`` or ``M`` suffix, optionally followed by ``B``
+(``4K``, ``2MB``).  Other values are rejected with ``EINVAL``.  A bigger
+minimum size makes the monitoring coarser but its overhead lower.  For the
+physical address space operations set, the size is applied after dividing it by
+``addr_unit``.  The value is applied when the inputs are committed to the
+kdamond.
 
 ``telescope`` turns Telescope sampling on (``1``) or off (``0``) for virtual
 address monitoring.  It is off by default, which is ordinary leaf page-table

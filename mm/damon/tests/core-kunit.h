@@ -502,6 +502,44 @@ static void damon_test_range_level(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, damon_range_level(0, PAGE_SIZE), 0);
 }
 
+/* With a 2MB minimum region size, regions stay aligned to and sized by 2MB */
+static void damon_test_min_sz_region_2mb(struct kunit *test)
+{
+	struct damon_ctx *c = damon_new_ctx();
+	struct damon_target *t = damon_new_target();
+	struct damon_addr_range range = {
+		.start = SZ_1M, .end = 100 * SZ_2M + SZ_1M};
+	struct damon_region *r;
+	int i;
+
+	c->min_sz_region = SZ_2M;
+	damon_add_target(c, t);
+
+	damon_set_regions(t, &range, 1, c->min_sz_region);
+	KUNIT_ASSERT_EQ(test, damon_nr_regions(t), 1u);
+	r = damon_first_region(t);
+	KUNIT_EXPECT_EQ(test, r->ar.start, 0ul);
+	KUNIT_EXPECT_EQ(test, r->ar.end, 101 * SZ_2M);
+
+	for (i = 0; i < 10; i++)
+		damon_split_regions_of(c, t, 4);
+	KUNIT_EXPECT_GT(test, damon_nr_regions(t), 1u);
+	damon_for_each_region(r, t) {
+		KUNIT_EXPECT_EQ(test, r->ar.start % SZ_2M, 0ul);
+		KUNIT_EXPECT_EQ(test, r->ar.end % SZ_2M, 0ul);
+		KUNIT_EXPECT_GE(test, damon_sz_region(r), (unsigned long)SZ_2M);
+	}
+
+	/* the hotness unit is the leaf entry, not the minimum region size */
+	r = damon_first_region(t);
+	r->nr_samples = 1;
+	r->nr_accesses = 1;
+	KUNIT_EXPECT_EQ(test, damon_region_hotness(c, r),
+			damon_sz_region(r) / DAMON_MIN_REGION *
+			damon_region_samplings(c, r));
+	damon_destroy_ctx(c);
+}
+
 static void damon_test_split_regions_of(struct kunit *test)
 {
 	struct damon_ctx *c = damon_new_ctx();
@@ -895,6 +933,7 @@ static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_time_stat),
 	KUNIT_CASE(damon_test_merge_regions_of),
 	KUNIT_CASE(damon_test_split_regions_of),
+	KUNIT_CASE(damon_test_min_sz_region_2mb),
 	KUNIT_CASE(damon_test_telescope_pieces),
 	KUNIT_CASE(damon_test_range_level),
 	KUNIT_CASE(damon_test_ops_registration),

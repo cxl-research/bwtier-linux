@@ -91,7 +91,8 @@ static struct mm_struct *damon_get_mm(struct damon_target *t)
  * Returns 0 on success, or negative error code otherwise.
  */
 static int damon_va_evenly_split_region(struct damon_target *t,
-		struct damon_region *r, unsigned int nr_pieces)
+		struct damon_region *r, unsigned int nr_pieces,
+		unsigned long min_sz_region)
 {
 	unsigned long sz_orig, sz_piece, orig_end;
 	struct damon_region *n = NULL, *next;
@@ -106,7 +107,7 @@ static int damon_va_evenly_split_region(struct damon_target *t,
 
 	orig_end = r->ar.end;
 	sz_orig = damon_sz_region(r);
-	sz_piece = ALIGN_DOWN(sz_orig / nr_pieces, DAMON_MIN_REGION);
+	sz_piece = ALIGN_DOWN(sz_orig / nr_pieces, min_sz_region);
 
 	if (!sz_piece)
 		return -EINVAL;
@@ -137,6 +138,7 @@ static unsigned long sz_range(struct damon_addr_range *r)
  *
  * vma		the head vma of the target address space
  * regions	an array of three address ranges that results will be saved
+ * min_sz_region	the minimum region size, to which the ranges are aligned
  *
  * This function receives an address space and finds three regions in it which
  * separated by the two biggest unmapped regions in the space.  Please refer to
@@ -146,7 +148,8 @@ static unsigned long sz_range(struct damon_addr_range *r)
  * Returns 0 if success, or negative error code otherwise.
  */
 static int __damon_va_three_regions(struct mm_struct *mm,
-				       struct damon_addr_range regions[3])
+				       struct damon_addr_range regions[3],
+				       unsigned long min_sz_region)
 {
 	struct damon_addr_range first_gap = {0}, second_gap = {0};
 	VMA_ITERATOR(vmi, mm, 0);
@@ -188,13 +191,21 @@ next:
 	if (first_gap.start > second_gap.start)
 		swap(first_gap, second_gap);
 
-	/* Store the result */
-	regions[0].start = ALIGN(start, DAMON_MIN_REGION);
-	regions[0].end = ALIGN(first_gap.start, DAMON_MIN_REGION);
-	regions[1].start = ALIGN(first_gap.end, DAMON_MIN_REGION);
-	regions[1].end = ALIGN(second_gap.start, DAMON_MIN_REGION);
-	regions[2].start = ALIGN(second_gap.end, DAMON_MIN_REGION);
-	regions[2].end = ALIGN(prev->vm_end, DAMON_MIN_REGION);
+	/*
+	 * Store the result.  Round the start addresses down and the end
+	 * addresses up so that every mapping is covered.
+	 */
+	regions[0].start = ALIGN_DOWN(start, min_sz_region);
+	regions[0].end = ALIGN(first_gap.start, min_sz_region);
+	regions[1].start = ALIGN_DOWN(first_gap.end, min_sz_region);
+	regions[1].end = ALIGN(second_gap.start, min_sz_region);
+	regions[2].start = ALIGN_DOWN(second_gap.end, min_sz_region);
+	regions[2].end = ALIGN(prev->vm_end, min_sz_region);
+
+	/* A big @min_sz_region can make the rounded regions overlap */
+	if (regions[0].end > regions[1].start ||
+			regions[1].end > regions[2].start)
+		return -EINVAL;
 
 	return 0;
 }
@@ -205,7 +216,8 @@ next:
  * Returns 0 on success, negative error code otherwise.
  */
 static int damon_va_three_regions(struct damon_target *t,
-				struct damon_addr_range regions[3])
+				struct damon_addr_range regions[3],
+				unsigned long min_sz_region)
 {
 	struct mm_struct *mm;
 	int rc;
@@ -215,7 +227,7 @@ static int damon_va_three_regions(struct damon_target *t,
 		return -EINVAL;
 
 	mmap_read_lock(mm);
-	rc = __damon_va_three_regions(mm, regions);
+	rc = __damon_va_three_regions(mm, regions, min_sz_region);
 	mmap_read_unlock(mm);
 
 	mmput(mm);
@@ -273,7 +285,7 @@ static void __damon_va_init_regions(struct damon_ctx *ctx,
 	unsigned long sz = 0, nr_pieces;
 	int i, tidx = 0;
 
-	if (damon_va_three_regions(t, regions)) {
+	if (damon_va_three_regions(t, regions, ctx->min_sz_region)) {
 		damon_for_each_target(ti, ctx) {
 			if (ti == t)
 				break;
@@ -287,8 +299,8 @@ static void __damon_va_init_regions(struct damon_ctx *ctx,
 		sz += regions[i].end - regions[i].start;
 	if (ctx->attrs.min_nr_regions)
 		sz /= ctx->attrs.min_nr_regions;
-	if (sz < DAMON_MIN_REGION)
-		sz = DAMON_MIN_REGION;
+	if (sz < ctx->min_sz_region)
+		sz = ctx->min_sz_region;
 
 	/* Set the initial three regions of the target */
 	for (i = 0; i < 3; i++) {
@@ -300,7 +312,8 @@ static void __damon_va_init_regions(struct damon_ctx *ctx,
 		damon_add_region(r, t);
 
 		nr_pieces = (regions[i].end - regions[i].start) / sz;
-		damon_va_evenly_split_region(t, r, nr_pieces);
+		damon_va_evenly_split_region(t, r, nr_pieces,
+				ctx->min_sz_region);
 	}
 }
 
@@ -325,9 +338,10 @@ static void damon_va_update(struct damon_ctx *ctx)
 	struct damon_target *t;
 
 	damon_for_each_target(t, ctx) {
-		if (damon_va_three_regions(t, three_regions))
+		if (damon_va_three_regions(t, three_regions,
+					ctx->min_sz_region))
 			continue;
-		damon_set_regions(t, three_regions, 3, DAMON_MIN_REGION);
+		damon_set_regions(t, three_regions, 3, ctx->min_sz_region);
 	}
 }
 
