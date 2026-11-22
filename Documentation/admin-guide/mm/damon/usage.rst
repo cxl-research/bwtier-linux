@@ -61,7 +61,7 @@ comma (",").
     │ :ref:`kdamonds <sysfs_kdamonds>`/nr_kdamonds
     │ │ :ref:`0 <sysfs_kdamond>`/state,pid,refresh_ms
     │ │ │ :ref:`contexts <sysfs_contexts>`/nr_contexts
-    │ │ │ │ :ref:`0 <sysfs_context>`/avail_operations,operations,addr_unit,telescope,max_ptes_per_sampling
+    │ │ │ │ :ref:`0 <sysfs_context>`/avail_operations,operations,addr_unit,telescope,max_ptes_per_sampling,samplings_per_aggr,max_aggr_samplings,afs_lo_pct,afs_hi_pct
     │ │ │ │ │ :ref:`monitoring_attrs <sysfs_monitoring_attrs>`/
     │ │ │ │ │ │ intervals/sample_us,aggr_us,update_us
     │ │ │ │ │ │ │ intervals_goal/access_bp,aggrs,min_sample_us,max_sample_us
@@ -188,9 +188,10 @@ details).  At the moment, only one context per kdamond is supported, so only
 contexts/<N>/
 -------------
 
-In each context directory, five files (``avail_operations``, ``operations``,
-``addr_unit``, ``telescope``, and ``max_ptes_per_sampling``) and three
-directories (``monitoring_attrs``, ``targets``, and ``schemes``) exist.
+In each context directory, nine files (``avail_operations``, ``operations``,
+``addr_unit``, ``telescope``, ``max_ptes_per_sampling``,
+``samplings_per_aggr``, ``max_aggr_samplings``, ``afs_lo_pct``, and
+``afs_hi_pct``) and three directories (``monitoring_attrs``, ``targets``, and ``schemes``) exist.
 
 DAMON supports multiple types of :ref:`monitoring operations
 <damon_design_configurable_operations_set>`, including those for virtual address
@@ -247,6 +248,33 @@ Each region counts the entries it checked in the aggregation interval
 (``nr_samples``), and the access frequency of the region is ``nr_accesses``
 divided by ``nr_samples``.  The file has no effect on physical-address
 monitoring.
+
+Every region has its own sampling frequency, which adapts to how often the
+region is found accessed.  A region is sampled ``samplings_per_aggr`` times in
+each aggregation interval (``aggr_us``), that is, once per ``aggr_us`` divided
+by ``samplings_per_aggr``.  The ``samplings_per_aggr`` file sets the value that
+regions start with.  The default is ``16``.  After each aggregation interval,
+the access ratio ``nr_accesses`` / ``nr_samples`` of a region is compared with
+two percentages.  If the ratio is above ``afs_hi_pct`` (``75`` by default), the
+region's ``samplings_per_aggr`` is doubled for the next interval, and if it is
+below ``afs_lo_pct`` (``25`` by default), it is halved.  It stays within 1 and
+65536.  A region that was split from another one starts with the sampling
+frequency of that region.  When two regions are merged, the merged region gets
+the average of their frequencies, weighted by region size.  Regions with
+sampling frequencies that differ by 2x or more are not merged.  Otherwise
+regions are merged if the numbers of accesses that they are estimated to have
+in an aggregation interval (the access ratio times ``samplings_per_aggr``)
+differ by at most 10% of the larger ``samplings_per_aggr``.  ``max_aggr_samplings``
+(``256`` by default) is the largest number of samplings that a region does in
+an aggregation interval, to bound the CPU time.  A region with a higher
+``samplings_per_aggr`` stops sampling once it reached the limit.  Its
+``samplings_per_aggr`` is still used for the hotness score of the region, which
+is the number of entries of its page table level, times its access ratio, times
+its ``samplings_per_aggr``.  ``afs_lo_pct`` must be smaller than
+``afs_hi_pct``, else committing the inputs fails.  The ``sample_us`` file is
+not used to schedule samplings.  It is only the unit that DAMOS access patterns
+and the ``nr_accesses`` values that DAMOS sees are scaled to, namely
+``aggr_us`` divided by ``sample_us``.
 
 .. _sysfs_monitoring_attrs:
 
@@ -696,6 +724,30 @@ for the target.  The eighth field (``X-Y:``) shows the start (``X``) and end
 counter).  Finally the tenth field (``X``) shows the ``age`` of the region
 (refer to :ref:`design <damon_design_age_tracking>` for more details of the
 counter).
+
+In a kernel with the per-region sampling frequency, the ``damon_aggregated``
+lines have two more fields after ``nr_accesses``: the number of the page table
+entries checked in the aggregation interval (``nr_samples``), and the
+``samplings_per_aggr`` that the region was sampled with in the interval.  The
+access frequency of the region is ``nr_accesses`` divided by ``nr_samples``.  The ``age``
+field comes last::
+
+    kdamond.0 46568 [027] 79357.842179: damon:damon_aggregated: target_id=0 nr_regions=11 122509119488-135708762112: 3 16 16 864
+
+The ``damon:damon_timekeeping`` tracepoint shows how long the kdamond spent
+in the aggregation interval that just ended.  There is one line per aggregation
+interval::
+
+    kdamond.0 46568 [027] 79357.842250: damon:damon_timekeeping: nr_loops=17 prepare_ns=21044/9120/66012 check_ns=15021/5630/40103 loop_ns=36500/14000/110500 aggr_ns=402510
+
+``nr_loops`` is the number of sampling loops: the first one of the interval,
+which only prepares the access checks of all regions, and the ones that checked
+the regions that were due.  ``prepare_ns``, ``check_ns``, and ``loop_ns`` show
+the average, minimum, and maximum time in nanoseconds of the access check
+preparation, of the access check, and of the whole sampling loop.  The first
+loop of an interval has no access check.  ``aggr_ns`` is the time of the
+aggregation round, which includes its access check, the merge, the schemes,
+the aggregation result reset, and the split.
 
 If the event was ``damon:damos_beofre_apply``, the ``perf script`` output would
 be somewhat like below::

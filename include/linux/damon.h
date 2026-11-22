@@ -55,8 +55,11 @@ struct damon_size_range {
  * @nr_samples:		Number of PTEs sampled in this aggregation interval.
  * @nr_accesses_bp:	@nr_accesses in basis point (0.01%) that updated for
  *			each sampling interval.
+ * @samplings_per_aggr:	Number of samplings of this region per aggregation
+ *			interval.
  * @list:		List head for siblings.
  * @age:		Age of this region.
+ * @hotness:		Hotness score of the last aggregation interval.
  *
  * @nr_accesses is reset to zero for every &damon_attrs->aggr_interval and be
  * increased for every &damon_attrs->sample_interval if an access to the region
@@ -79,6 +82,18 @@ struct damon_size_range {
  * be used when the aggregation interval is too huge and therefore cannot wait
  * for it before getting the access monitoring results.
  *
+ * Every region has its own sampling frequency.  The region is sampled
+ * @samplings_per_aggr times in an aggregation interval, that is, once per
+ * (&damon_attrs->aggr_interval / @samplings_per_aggr).  At most
+ * &damon_ctx->max_aggr_samplings of the samplings are done, but
+ * @samplings_per_aggr is used for the hotness score even if it is larger.
+ * Core adapts @samplings_per_aggr after each aggregation interval, see
+ * damon_ctx->afs_lo_pct.  Zero means that the context's default is used.
+ *
+ * @hotness is the number of the page table entries of the level that the
+ * region is profiled at, times the access ratio @nr_accesses / @nr_samples,
+ * times @samplings_per_aggr.
+ *
  * @age is initially zero, increased for each aggregation interval, and reset
  * to zero again if the access frequency is significantly changed.  If two
  * regions are merged into a new region, both @nr_accesses and @age of the new
@@ -90,11 +105,19 @@ struct damon_region {
 	unsigned int nr_accesses;
 	unsigned int nr_samples;
 	unsigned int nr_accesses_bp;
+	unsigned int samplings_per_aggr;
 	struct list_head list;
 
 	unsigned int age;
+	unsigned long hotness;
 /* private: Internal value for age calculation.  Scaled like nr_accesses_bp. */
 	unsigned int last_nr_accesses;
+	/* samplings done in this aggregation interval */
+	unsigned int samplings_done;
+	/* time (ktime ns) of the next sampling, or U64_MAX if none is left */
+	u64 next_sample_ns;
+	/* set while the ops should prepare or check this region */
+	bool sample_due;
 };
 
 /**
@@ -769,6 +792,17 @@ struct damon_attrs {
  * @telescope:		Use accessed bits on non-leaf page tables when the
  *			region fully covers that level.  Virtual address
  *			monitoring only.  Off by default.
+ * @samplings_per_aggr:	Initial &damon_region->samplings_per_aggr of regions.
+ *			%DAMON_DEFAULT_SAMPLINGS_PER_AGGR by default.
+ * @max_aggr_samplings:	Maximum number of samplings that a region does in one
+ *			aggregation interval.
+ *			%DAMON_DEFAULT_MAX_AGGR_SAMPLINGS by default.
+ * @afs_lo_pct:		If a region's access ratio (percent) of the last
+ *			aggregation interval is below this, its sampling
+ *			frequency is halved.  25 by default.
+ * @afs_hi_pct:		If a region's access ratio (percent) of the last
+ *			aggregation interval is above this, its sampling
+ *			frequency is doubled.  75 by default.
  * @adaptive_targets:	Head of monitoring targets (&damon_target) list.
  * @schemes:		Head of schemes (&damos) list.
  */
@@ -814,6 +848,10 @@ struct damon_ctx {
 	unsigned long min_sz_region;
 	unsigned int max_ptes_per_sampling;
 	bool telescope;
+	unsigned int samplings_per_aggr;
+	unsigned int max_aggr_samplings;
+	unsigned int afs_lo_pct;
+	unsigned int afs_hi_pct;
 
 	struct list_head adaptive_targets;
 	struct list_head schemes;
@@ -963,7 +1001,34 @@ static inline unsigned int damon_max_nr_accesses(const struct damon_attrs *attrs
 
 #define DAMON_MAX_PTES_PER_SAMPLING	512
 
+#define DAMON_DEFAULT_SAMPLINGS_PER_AGGR	16
+#define DAMON_DEFAULT_MAX_AGGR_SAMPLINGS	256
+/* upper bound of the samplings_per_aggr of a region */
+#define DAMON_MAX_SAMPLINGS_PER_AGGR		(1U << 16)
+#define DAMON_DEFAULT_AFS_LO_PCT		25
+#define DAMON_DEFAULT_AFS_HI_PCT		75
+
+/* min, max, and sum of the durations of some operation, in nanoseconds */
+struct damon_time_stat {
+	unsigned int nr;
+	u64 sum;
+	u64 min;
+	u64 max;
+};
+
+/*
+ * Time spent by the kdamond in one aggregation interval.  The three stats are
+ * over the sampling loops, and @aggr_ns is the aggregation round.
+ */
+struct damon_timekeeping {
+	struct damon_time_stat prepare;
+	struct damon_time_stat check;
+	struct damon_time_stat loop;
+	u64 aggr_ns;
+};
+
 int damon_region_level(struct damon_ctx *ctx, struct damon_region *r);
+unsigned long damon_region_hotness(struct damon_ctx *ctx, struct damon_region *r);
 
 /* Round @nr down to a power of two in [1, DAMON_MAX_PTES_PER_SAMPLING] */
 static inline unsigned int damon_sanitize_max_ptes(unsigned long nr)

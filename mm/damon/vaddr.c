@@ -561,8 +561,10 @@ static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
 		mm = damon_get_mm(t);
 		if (!mm)
 			continue;
-		damon_for_each_region(r, t)
-			__damon_va_prepare_access_check(ctx, mm, r);
+		damon_for_each_region(r, t) {
+			if (r->sample_due)
+				__damon_va_prepare_access_check(ctx, mm, r);
+		}
 		mmput(mm);
 	}
 }
@@ -853,6 +855,8 @@ static unsigned int damon_va_check_accesses(struct damon_ctx *ctx)
 		mm = damon_get_mm(t);
 		same_target = false;
 		damon_for_each_region(r, t) {
+			if (!r->sample_due)
+				continue;
 			__damon_va_check_access(ctx, mm, r, same_target,
 					&ctx->attrs);
 			max_nr_accesses = max(

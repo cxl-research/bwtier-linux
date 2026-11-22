@@ -62,8 +62,11 @@ static void damon_pa_prepare_access_checks(struct damon_ctx *ctx)
 	struct damon_region *r;
 
 	damon_for_each_target(t, ctx) {
-		damon_for_each_region(r, t)
-			__damon_pa_prepare_access_check(r, ctx->addr_unit);
+		damon_for_each_region(r, t) {
+			if (r->sample_due)
+				__damon_pa_prepare_access_check(r,
+						ctx->addr_unit);
+		}
 	}
 }
 
@@ -81,12 +84,18 @@ static bool damon_pa_young(phys_addr_t paddr, unsigned long *folio_sz)
 	return accessed;
 }
 
+/*
+ * The result of the last check, reused for the regions checked after it in the
+ * same call of damon_pa_check_accesses().  Regions are checked at different
+ * times in different calls, so it must not be kept over calls.
+ */
+static phys_addr_t last_addr;
+static unsigned long last_folio_sz = PAGE_SIZE;
+static bool last_accessed;
+
 static void __damon_pa_check_access(struct damon_region *r,
 		struct damon_attrs *attrs, unsigned long addr_unit)
 {
-	static phys_addr_t last_addr;
-	static unsigned long last_folio_sz = PAGE_SIZE;
-	static bool last_accessed;
 	phys_addr_t sampling_addr = damon_pa_phys_addr(
 			r->sampling_addr, addr_unit);
 
@@ -109,8 +118,13 @@ static unsigned int damon_pa_check_accesses(struct damon_ctx *ctx)
 	struct damon_region *r;
 	unsigned int max_nr_accesses = 0;
 
+	last_addr = 0;
+	last_folio_sz = PAGE_SIZE;
+	last_accessed = false;
 	damon_for_each_target(t, ctx) {
 		damon_for_each_region(r, t) {
+			if (!r->sample_due)
+				continue;
 			__damon_pa_check_access(
 					r, &ctx->attrs, ctx->addr_unit);
 			max_nr_accesses = max(
