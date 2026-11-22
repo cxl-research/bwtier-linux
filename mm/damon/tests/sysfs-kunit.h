@@ -71,8 +71,53 @@ static void damon_sysfs_test_add_targets(struct kunit *test)
 	kfree(sysfs_target);
 }
 
+static void damon_sysfs_test_parse_min_region_size(struct kunit *test)
+{
+	unsigned long size = 0;
+
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("2097152", &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (unsigned long)SZ_2M);
+	size = 0;
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("2M\n", &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (unsigned long)SZ_2M);
+	size = 0;
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("2MB", &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (unsigned long)SZ_2M);
+	size = 0;
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("2048k", &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (unsigned long)SZ_2M);
+	size = 0;
+	KUNIT_EXPECT_EQ(test, damon_sysfs_parse_min_region_size(
+				"4096\n", &size), PAGE_SIZE == 4096 ? 0 : -EINVAL);
+
+	size = 1;
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("0", &size), -EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("1M", &size), -EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("2MBx", &size),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("1G", &size), -EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("abc", &size),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("", &size), -EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			damon_sysfs_parse_min_region_size("-2M", &size),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, size, 1ul);
+}
+
 static struct kunit_case damon_sysfs_test_cases[] = {
 	KUNIT_CASE(damon_sysfs_test_add_targets),
+	KUNIT_CASE(damon_sysfs_test_parse_min_region_size),
 	{},
 };
 

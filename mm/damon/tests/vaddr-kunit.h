@@ -81,7 +81,7 @@ static void damon_test_three_regions_in_vmas(struct kunit *test)
 	if (__link_vmas(&mm.mm_mt, vmas, ARRAY_SIZE(vmas)))
 		kunit_skip(test, "Failed to create VMA tree");
 
-	__damon_va_three_regions(&mm, regions);
+	__damon_va_three_regions(&mm, regions, DAMON_MIN_REGION);
 
 	KUNIT_EXPECT_EQ(test, 10ul, regions[0].start);
 	KUNIT_EXPECT_EQ(test, 25ul, regions[0].end);
@@ -254,7 +254,8 @@ static void damon_test_split_evenly_fail(struct kunit *test,
 
 	damon_add_region(r, t);
 	KUNIT_EXPECT_EQ(test,
-			damon_va_evenly_split_region(t, r, nr_pieces), -EINVAL);
+			damon_va_evenly_split_region(t, r, nr_pieces,
+				DAMON_MIN_REGION), -EINVAL);
 	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), 1u);
 
 	damon_for_each_region(r, t) {
@@ -275,7 +276,8 @@ static void damon_test_split_evenly_succ(struct kunit *test,
 
 	damon_add_region(r, t);
 	KUNIT_EXPECT_EQ(test,
-			damon_va_evenly_split_region(t, r, nr_pieces), 0);
+			damon_va_evenly_split_region(t, r, nr_pieces,
+				DAMON_MIN_REGION), 0);
 	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), nr_pieces);
 
 	damon_for_each_region(r, t) {
@@ -294,8 +296,8 @@ static void damon_test_split_evenly_succ(struct kunit *test,
 
 static void damon_test_split_evenly(struct kunit *test)
 {
-	KUNIT_EXPECT_EQ(test, damon_va_evenly_split_region(NULL, NULL, 5),
-			-EINVAL);
+	KUNIT_EXPECT_EQ(test, damon_va_evenly_split_region(NULL, NULL, 5,
+				DAMON_MIN_REGION), -EINVAL);
 
 	damon_test_split_evenly_fail(test, 0, 100, 0);
 	damon_test_split_evenly_succ(test, 0, 100, 10);
@@ -305,6 +307,77 @@ static void damon_test_split_evenly(struct kunit *test)
 	damon_test_split_evenly_fail(test, 5, 6, 2);
 }
 
+/*
+ * With a 2MB minimum region size, the three regions should be aligned to 2MB
+ * so that every mapping is covered.  If the gaps are smaller than the minimum
+ * region size, the aligned regions would overlap and thus must be rejected.
+ */
+static void damon_test_three_regions_min_sz(struct kunit *test)
+{
+	static struct mm_struct mm;
+	struct damon_addr_range regions[3] = {0};
+	static struct vm_area_struct vmas[] = {
+		(struct vm_area_struct) {.vm_start = 0x100000, .vm_end = 0x180000},
+		(struct vm_area_struct) {.vm_start = 0x10100000, .vm_end = 0x10180000},
+		(struct vm_area_struct) {.vm_start = 0x20100000, .vm_end = 0x20180000},
+		(struct vm_area_struct) {.vm_start = 0x30100000, .vm_end = 0x30180000},
+	};
+	static struct vm_area_struct small_gap_vmas[] = {
+		(struct vm_area_struct) {.vm_start = 0x1000, .vm_end = 0x2000},
+		(struct vm_area_struct) {.vm_start = 0x3000, .vm_end = 0x4000},
+		(struct vm_area_struct) {.vm_start = 0x5000, .vm_end = 0x6000},
+	};
+
+	mt_init_flags(&mm.mm_mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	if (__link_vmas(&mm.mm_mt, vmas, ARRAY_SIZE(vmas)))
+		kunit_skip(test, "Failed to create VMA tree");
+
+	KUNIT_EXPECT_EQ(test, __damon_va_three_regions(&mm, regions, SZ_2M), 0);
+	KUNIT_EXPECT_EQ(test, 0ul, regions[0].start);
+	KUNIT_EXPECT_EQ(test, 0x200000ul, regions[0].end);
+	KUNIT_EXPECT_EQ(test, 0x10000000ul, regions[1].start);
+	KUNIT_EXPECT_EQ(test, 0x10200000ul, regions[1].end);
+	KUNIT_EXPECT_EQ(test, 0x20000000ul, regions[2].start);
+	KUNIT_EXPECT_EQ(test, 0x30200000ul, regions[2].end);
+
+	mtree_destroy(&mm.mm_mt);
+	mt_init_flags(&mm.mm_mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	if (__link_vmas(&mm.mm_mt, small_gap_vmas,
+				ARRAY_SIZE(small_gap_vmas)))
+		kunit_skip(test, "Failed to create VMA tree");
+	KUNIT_EXPECT_EQ(test, __damon_va_three_regions(&mm, regions, 1), 0);
+	KUNIT_EXPECT_EQ(test,
+			__damon_va_three_regions(&mm, regions, SZ_2M), -EINVAL);
+}
+
+static void damon_test_split_evenly_min_sz(struct kunit *test)
+{
+	struct damon_target *t = damon_new_target();
+	struct damon_region *r = damon_new_region(0, 10 * SZ_2M);
+	unsigned long expected_ends[] = {2 * SZ_2M, 4 * SZ_2M, 6 * SZ_2M,
+		10 * SZ_2M};
+	int i = 0;
+
+	damon_add_region(r, t);
+	/* 10 * 2MB / 4 pieces = 5MB, rounded down to 4MB */
+	KUNIT_EXPECT_EQ(test, damon_va_evenly_split_region(t, r, 4, SZ_2M), 0);
+	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), 4u);
+	damon_for_each_region(r, t) {
+		KUNIT_EXPECT_EQ(test, r->ar.end, expected_ends[i++]);
+		KUNIT_EXPECT_EQ(test, r->ar.start % SZ_2M, 0ul);
+	}
+	damon_free_target(t);
+
+	/* a region smaller than two minimum sized pieces cannot be split */
+	t = damon_new_target();
+	r = damon_new_region(0, 3 * SZ_2M);
+	damon_add_region(r, t);
+	KUNIT_EXPECT_EQ(test, damon_va_evenly_split_region(t, r, 4, SZ_2M),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), 1u);
+	damon_free_target(t);
+}
+
 static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_three_regions_in_vmas),
 	KUNIT_CASE(damon_test_apply_three_regions1),
@@ -312,6 +385,8 @@ static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_apply_three_regions3),
 	KUNIT_CASE(damon_test_apply_three_regions4),
 	KUNIT_CASE(damon_test_split_evenly),
+	KUNIT_CASE(damon_test_three_regions_min_sz),
+	KUNIT_CASE(damon_test_split_evenly_min_sz),
 	{},
 };
 
